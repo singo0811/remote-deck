@@ -786,6 +786,28 @@ export class HostAgent {
         return;
       }
       if (url.pathname === '/api/lan-devices') {
+        // This endpoint makes the host actively scan the LAN, so it must not be
+        // usable as a free "scan my network" service by any random web page the
+        // operator happens to visit: browsers can only read the reply when CORS
+        // allows it, so omit that header for foreign origins. Native clients
+        // (phone app, CLI, MCP) are unaffected because CORS does not apply.
+        const origin = req.headers.origin;
+        if (origin) {
+          let sameOrigin = false;
+          try {
+            sameOrigin = new URL(origin).host === req.headers.host;
+          } catch {}
+          if (!sameOrigin) {
+            res.removeHeader('access-control-allow-origin');
+          }
+        }
+        const now = Date.now();
+        if (now - (this.lastLanScanAt || 0) < 3000) {
+          res.writeHead(429, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '扫描过于频繁，请稍后再试' }));
+          return;
+        }
+        this.lastLanScanAt = now;
         const peers = await this.discoverOtherLanDevices(750);
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
