@@ -394,8 +394,24 @@ export function createRelayServer(options = {}) {
         });
       });
       const addr = httpServer.address();
+      const boundPort = typeof addr === 'object' && addr ? addr.port : port;
+      // A relay without a shared secret accepts any agent that registers, so a
+      // publicly reachable instance would let anyone inject a fake device into
+      // the controller's device list. Warn loudly instead of failing silently.
+      if (!relaySecret) {
+        const loopbackOnly =
+          host === '127.0.0.1' || host === '::1' || host === 'localhost';
+        const banner = loopbackOnly
+          ? `[relay] listening on ${host}:${boundPort} without --secret (loopback only, OK)`
+          : `[relay] WARNING: listening on ${host}:${boundPort} WITHOUT --secret/RELAY_SECRET — ` +
+            'any client can register an agent. Set a secret before exposing this port.';
+        if (loopbackOnly) console.log(banner);
+        else console.warn(banner);
+      } else {
+        console.log(`[relay] listening on ${host}:${boundPort} (secret required)`);
+      }
       return {
-        port: typeof addr === 'object' && addr ? addr.port : port,
+        port: boundPort,
         host,
       };
     },

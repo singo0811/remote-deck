@@ -84,13 +84,15 @@ npm run start:agent
 1. 在公网 VPS 启动中继服务端（或使用 `docker compose up -d`）：
 
 ```bash
-npm run start:relay -- --port 9600
+npm run start:relay -- --port 9600 --secret 一串足够长的随机口令
 ```
 
-2. 在被控机器连接中继：
+> **公网部署必须带 `--secret`（或环境变量 `RELAY_SECRET`）**：不带的话任何人都能向中继注册一个假的被控端，出现在你的设备列表里。服务端在没有 secret 且监听非回环地址时会打印明显告警。
+
+2. 在被控机器连接中继（secret 需一致）：
 
 ```bash
-npm run start:agent -- --relay ws://你的公网IP或域名:9600/ws
+npm run start:agent -- --relay ws://你的公网IP或域名:9600/ws --relay-secret 同一串口令
 ```
 
 3. 手机（4G/5G 外网）或任何浏览器打开 `http(s)://你的公网IP或域名:9600`，选择在线设备并输入配对码连接。同在局域网时会自动优先切走内网直连，外网时优先尝试 WebRTC P2P 并由中继保底。
