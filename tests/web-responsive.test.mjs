@@ -53,3 +53,25 @@ test('built web PWA bundle contains required adaptive assets and manifest', asyn
   assert.match(css, /\.tier-tablet/);
   assert.match(css, /touch-dock/);
 });
+
+// Guards the low-latency / interaction features added after the initial PWA
+// shell: they live in the bundled app, so a silent build regression would
+// otherwise only show up when someone connects from a browser.
+test('built web bundle ships separate-cursor, pointer-lock, drag-drop upload and Opus audio', async () => {
+  const js = await fs.readFile(path.join(distDir, 'app.js'), 'utf8');
+  const css = await fs.readFile(path.join(distDir, 'app.css'), 'utf8');
+
+  for (const marker of [
+    'separateCursor',      // host streams a cursor shape separate from the video
+    'cursorShape',         // canvas overlay paints the remote cursor
+    'requestPointerLock',  // relative mouse mode for remote games/CAD
+    'rd-upload-progress',  // drag-and-drop upload progress + cancel UI
+    'AudioDecoder',        // WebCodecs Opus decode path
+    'roi',                 // ROI frame painting
+  ]) {
+    assert.ok(js.includes(marker), `app.js is missing feature marker: ${marker}`);
+  }
+  for (const cls of ['.rd-remote-cursor', '.rd-drop-overlay', '.rd-upload-progress', '.rd-pointer-lock-pill']) {
+    assert.ok(css.includes(cls), `app.css is missing: ${cls}`);
+  }
+});

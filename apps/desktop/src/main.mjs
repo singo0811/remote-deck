@@ -154,6 +154,15 @@ async function clearLogonAutostart() {
       windowsHide: true,
     });
   } catch {}
+  // The task may have been registered with RunLevel=HighestAvailable, which a
+  // non-elevated process cannot delete; retry through the UAC helper.
+  if (taskExists(AUTOSTART_TASK)) {
+    try {
+      await runElevatedBat([`schtasks /Delete /TN "${AUTOSTART_TASK}" /F`]);
+    } catch (err) {
+      console.warn(`[remote-deck] could not remove ${AUTOSTART_TASK}: ${err?.message || err}`);
+    }
+  }
   try {
     if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: false });
   } catch {}
