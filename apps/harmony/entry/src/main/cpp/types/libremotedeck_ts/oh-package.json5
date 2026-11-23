@@ -1,0 +1,4 @@
+{
+  "name": "libremotedeck_ts.so",
+  "types": "./index.d.ts"
+}

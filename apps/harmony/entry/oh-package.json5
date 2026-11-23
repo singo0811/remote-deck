@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "RemoteDeck HarmonyOS entry module",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "libremotedeck_ts.so": "file:./src/main/cpp/types/libremotedeck_ts"
+  }
+}

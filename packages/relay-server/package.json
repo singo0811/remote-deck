@@ -1,0 +1,13 @@
+{
+  "name": "@remote-deck/relay-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "remote-deck-relay": "./src/cli.mjs"
+  },
+  "dependencies": {
+    "@remote-deck/shared": "*",
+    "ws": "^8.23.0"
+  }
+}

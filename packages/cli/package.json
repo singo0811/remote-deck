@@ -1,0 +1,17 @@
+{
+  "name": "@remote-deck/cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal CLI client for RemoteDeck with ANSI TrueColor & Kitty graphics rendering and doctor diagnostics.",
+  "main": "./src/cli.mjs",
+  "bin": {
+    "remote-deck-cli": "./src/cli.mjs"
+  },
+  "dependencies": {
+    "@remote-deck/mcp-server": "*",
+    "@remote-deck/shared": "*",
+    "jpeg-js": "^0.4.4",
+    "ws": "^8.23.0"
+  }
+}

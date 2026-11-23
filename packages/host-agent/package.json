@@ -1,0 +1,22 @@
+{
+  "name": "@remote-deck/host-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/agent.mjs",
+  "exports": {
+    ".": "./src/agent.mjs"
+  },
+  "bin": {
+    "remote-deck-agent": "./src/cli.mjs"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "build:tsnet": "node scripts/build-tsnet.mjs"
+  },
+  "dependencies": {
+    "@remote-deck/shared": "*",
+    "werift": "^0.28.0",
+    "ws": "^8.23.0"
+  }
+}

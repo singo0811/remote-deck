@@ -1,0 +1,15 @@
+{
+  "name": "@remote-deck/mcp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP Server for AI agents to view and control RemoteDeck hosts.",
+  "main": "./src/index.mjs",
+  "bin": {
+    "remote-deck-mcp": "./src/index.mjs"
+  },
+  "dependencies": {
+    "@remote-deck/shared": "*",
+    "ws": "^8.23.0"
+  }
+}

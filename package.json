@@ -1,0 +1,27 @@
+{
+  "name": "remote-deck",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "RemoteDeck: LAN + WAN remote desktop, terminal & file workspace with adaptive PC/Tablet/Phone UI.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm --workspace @remote-deck/web run build",
+    "build:harmony": "node apps/harmony/scripts/build-hap.mjs",
+    "build:native": "npm --workspace @remote-deck/host-agent run build:native",
+    "build:tsnet": "npm --workspace @remote-deck/host-agent run build:tsnet",
+    "package:win": "npm run build:native && npm run build && npm --workspace @remote-deck/desktop run package",
+    "start:app": "npm --workspace @remote-deck/desktop run start",
+    "start:relay": "node packages/relay-server/src/cli.mjs",
+    "start:agent": "node packages/host-agent/src/cli.mjs",
+    "start:mcp": "node packages/mcp-server/src/index.mjs",
+    "start:cli": "node packages/cli/src/cli.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

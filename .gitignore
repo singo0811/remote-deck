@@ -1,0 +1,52 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+out/
+
+# host agent native binaries (built by `npm run build:native` / `build:tsnet`)
+packages/host-agent/bin/
+packages/host-agent/tsnet/*.so
+packages/host-agent/tsnet/*.h
+packages/host-agent/tsnet/go.sum.tmp
+
+# web bundle output
+apps/web/dist/
+
+# harmony build output / generator caches
+apps/harmony/entry/build/
+apps/harmony/entry/.preview/
+apps/harmony/entry/libs/*/*.so
+apps/harmony/.hvigor/
+apps/harmony/.cxx/
+apps/harmony/oh_modules/
+apps/harmony/entry/oh_modules/
+apps/harmony/build/
+apps/harmony/local.properties
+apps/harmony/**/*.hap
+apps/harmony/**/*.har
+apps/harmony/entry/src/main/cpp/libtsnet_bridge.h
+
+# runtime state / identities / credentials must never be committed
+*.state
+agent-identity.json
+tailscaled.log*.txt
+tailscaled.state
+tsnet-state/
+profile-data/
+*.pem
+*.p12
+*.jks
+*.keystore
+
+# logs / temp
+*.log
+*.log1.txt
+*.log2.txt
+npm-debug.log*
+.tmp/
+*.bak
+*.bak-*
