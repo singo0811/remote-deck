@@ -754,6 +754,23 @@ export class HostAgent {
         return;
       }
       const url = new URL(req.url || '/', 'http://localhost');
+      // Same gate the phone-control POST routes use: loopback (the packaged
+      // desktop window) is trusted, everything else must present the pairing
+      // PIN. /api/phones/frame returns a live screenshot of the mirrored phone,
+      // so leaving it open let any LAN peer — or any web page, since CORS is * —
+      // grab phone frames.
+      const allowPrivileged = () => {
+        const remoteIp = req.socket?.remoteAddress || '';
+        const isLoopback =
+          remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1';
+        if (isLoopback || !this.pin) return true;
+        const headerPin = String(req.headers['x-remotedeck-pin'] || '').trim().toUpperCase();
+        return headerPin === this.pin;
+      };
+      const forbid = () => {
+        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Forbidden' }));
+      };
       if (url.pathname === '/api/info' || url.pathname === '/api/health') {
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
@@ -817,12 +834,14 @@ export class HostAgent {
         return;
       }
       if (url.pathname === '/api/phones' && req.method === 'GET') {
+        if (!allowPrivileged()) { forbid(); return; }
         const devices = await listConnectedPhones();
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true, devices }));
         return;
       }
       if (url.pathname === '/api/phones/frame' && req.method === 'GET') {
+        if (!allowPrivileged()) { forbid(); return; }
         try {
           const serial = url.searchParams.get('serial') || '';
           const frame = await capturePhoneFrame(serial);

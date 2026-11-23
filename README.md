@@ -106,3 +106,48 @@ npm run start:agent -- --tunnel
 ```bash
 npm test
 ```
+
+## 端口与局域网发现
+
+被控端只用两个固定端口，改动它们会让已经配对过的手机找不到电脑：
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 9601 | TCP | 主控服务（PWA 静态资源、`/api/*`、`/ws` 控制通道、`/ws/phone-stream`） |
+| 9602 | UDP | 局域网广播发现（手机发送 `REMOTEDECK_DISCOVER` 后回设备信息） |
+| 9603 | TCP | 内嵌组网（tsnet）转发到本机的端口，供 tailnet 内设备回连 |
+
+服务启动时会优先占用 9601；如果被占用会在约 6.5 秒内重试，仍不行才退到随机端口，并在日志里告警。若占用者**本身就是本机另一个 RemoteDeck 宿主**（例如开机服务实例），这份实例会降级成"只显示界面"的客户端，不会另起一个手机发现不了的宿主。
+
+## 开机启动：两种模式只能留一个
+
+| 模式 | 入口 | 特点 |
+|---|---|---|
+| 登录自启（默认建议） | 计划任务 `RemoteDeckHost` | 登录后拉起，有桌面窗口，普通场景够用 |
+| 开机服务 | 计划任务 `RemoteDeckBoot` + `remote-deck-svc.exe` | 以 SYSTEM 在开机时拉起、意外退出自动重启、可覆盖锁屏场景；**没有桌面窗口** |
+
+两条链路会抢同一个 9601，所以不要同时启用：安装开机服务会自动清掉登录自启（`clearLogonAutostart`），需要回到登录自启时再手动把「管理员权限自启」打开。
+
+## 构建顺序
+
+```bash
+npm run build:native   # remote-native.exe / remote-deck-svc.exe（Go，需要本机 Go）
+npm run build          # Web PWA
+npm run build:tsnet    # remote-tsnet.exe + HarmonyOS libtsnet_bridge.so
+npm run build:harmony  # HAP（依赖 build:tsnet 产出的 .so）
+npm run package:win    # 打包 dist/RemoteDeck-win32-x64
+```
+
+`build:tsnet` 有两个前置条件，缺一会在构建期直接报错而不是运行时才炸：
+
+- `packages/host-agent/tsnet/go.mod` 要求 **Go 1.27+**，脚本会用该工具链暂存一份 GOROOT 打补丁；离线机器需要提前把 `golang.org/toolchain` 缓存好。
+- OpenHarmony NDK（`hdc`/clang）需在 DevEco Studio 安装路径下，脚本会自动探测。
+
+## 排障：手机连不上电脑
+
+1. 电脑端执行 `curl http://127.0.0.1:9601/api/health`，应返回 `deviceId` / `lanEndpoints`。
+2. 确认 9601（TCP）和 9602（UDP）在监听：`netstat -ano | findstr "9601 9602"`。
+3. 端口不是 9601 说明被别的程序占了，此时手机会按旧地址连不上——关掉占用进程后重启 App 即可。
+4. 手机端重新扫描局域网设备（走 9602 广播），或手动填电脑的 `IP:9601`。
+5. 跨网（非同一局域网）时改用内嵌组网：手机与电脑都要在 tailnet 里，并把 9601 换成电脑的 `100.x` 地址。
+
