@@ -104,6 +104,7 @@ type captureReq struct {
 }
 
 type mouseReq struct {
+	ReqID     string  `json:"reqId"`
 	Action    string  `json:"action"`
 	X         float64 `json:"x"`
 	Y         float64 `json:"y"`
@@ -230,7 +231,14 @@ func main() {
 		case cmdMouse:
 			var req mouseReq
 			if err := json.Unmarshal(payload, &req); err == nil {
-				if err := injectMouse(req); err != nil {
+				err := injectMouse(req)
+				if req.ReqID != "" {
+					reply := map[string]any{"reqId": req.ReqID, "op": "mouse", "ok": err == nil}
+					if err != nil {
+						reply["error"] = err.Error()
+					}
+					writeJSONFrame(evtJSON, reply)
+				} else if err != nil {
 					fmt.Fprintf(os.Stderr, "mouse error: %v\n", err)
 				}
 			}

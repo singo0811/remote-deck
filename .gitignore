@@ -50,3 +50,6 @@ npm-debug.log*
 .tmp/
 *.bak
 *.bak-*
+
+# native build artifact produced by cross-compiles
+packages/host-agent/native/native

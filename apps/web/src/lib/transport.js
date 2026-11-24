@@ -5,6 +5,7 @@ import {
   decodeBinaryEnvelope,
   encodeBinaryEnvelope,
 } from './protocol.js';
+import { RTC_VIDEO_CHANNEL, RTC_VIDEO_READY, RtcVideoAssembler } from '@remote-deck/shared/rtc-video';
 
 export function toWsUrl(inputUrl) {
   const raw = String(inputUrl || '').trim();
@@ -124,15 +125,15 @@ export class RemoteTransport {
         const msg = err?.message || '';
         const isAuthErr = msg.includes('配对码') || msg.includes('PIN') || msg.includes('拒绝');
         if (!hasFallback || isAuthErr) throw err;
-        this.emitLog(`直连失败，自动切换外网隧道: ${fbWs}`);
-        this.emitStatus('connecting', '正在通过外网隧道连接...');
+        this.emitLog(`直连失败，切换到服务器: ${fbWs}`);
+        this.emitStatus('connecting', '正在连接服务器...');
         await this.#connectDirectWs(fbWs, pin, 'tunnel', 12000);
         return;
       }
     }
 
     // Relay + Smart Route Racing mode
-    this.emitLog(`连接中继/信令: ${wsUrl}`);
+    this.emitLog(`连接服务器: ${wsUrl}`);
     this.emitStatus('connecting', '正在查找设备并探测最优链路...');
     await this.#connectViaRelay(wsUrl, deviceId, pin);
   }
@@ -197,7 +198,7 @@ export class RemoteTransport {
           settled = true;
           clearTimeout(timer);
           try { ws.close(); } catch {}
-          reject(new Error(msg.error || '配对码认证失败'));
+          reject(new Error(msg.error || '密码错误'));
         }
       };
 
@@ -230,7 +231,7 @@ export class RemoteTransport {
     });
     if (usable.length === 0) return null;
 
-    this.emitLog(`探测内网直连候选 (${usable.map((u) => u.ip).join(', ')})...`);
+    this.emitLog(`探测局域网地址 (${usable.map((u) => u.ip).join(', ')})...`);
     try {
       const winner = await Promise.any(
         usable.map(async (c) => {
@@ -263,10 +264,10 @@ export class RemoteTransport {
         ws.send(JSON.stringify({ type: MSG.CONTROLLER_CONNECT, deviceId }));
       };
 
-      ws.onerror = () => fail(new Error(`无法连接中继服务器 ${relayWsUrl}`));
+      ws.onerror = () => fail(new Error(`无法连接服务器 ${relayWsUrl}`));
 
       ws.onclose = () => {
-        if (!settled) fail(new Error('中继连接提前关闭'));
+        if (!settled) fail(new Error('服务器连接提前关闭'));
         if (this.activeChannel?.ws === ws && !this.closed) {
           this.#handleUnexpectedDrop('连接已断开');
         }
@@ -293,7 +294,7 @@ export class RemoteTransport {
           // 1. Race LAN / Tailscale direct first
           const lanWinner = await this.#raceLanCandidates(msg.lanEndpoints, pin);
           if (lanWinner) {
-            this.emitLog(`内网直连成功 (${lanWinner.kind})`);
+            this.emitLog(`局域网连接成功 (${lanWinner.kind})`);
             this.#activateChannel(lanWinner);
             try { ws.close(); } catch {}
             this.signalingWs = null;
@@ -303,28 +304,39 @@ export class RemoteTransport {
           }
 
           // 2. Try WebRTC P2P in background while keeping Relay ready
-          if (typeof RTCPeerConnection !== 'undefined') {
-            this.#startWebRtcUpgrade(ws, msg.iceServers || [], pin);
+          if (typeof RTCPeerConnection !== 'undefined' && this.signalingWs === ws) {
+            this.#startWebRtcUpgrade(ws, msg.iceServers || [], pin, () => {
+              settled = true;
+              resolve();
+            });
           }
           return;
         }
 
+        if (this.signalingWs !== ws) return;
         if (msg.type === MSG.RTC_ANSWER && this.rtcPc && msg.sdp) {
+          const pc = this.rtcPc;
+          const pending = this.pendingRtcIce;
           try {
-            await this.rtcPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            for (const candidate of pending.splice(0)) {
+              try { await pc.addIceCandidate(candidate); } catch {}
+            }
           } catch {}
           return;
         }
 
         if (msg.type === MSG.RTC_ICE && this.rtcPc && msg.candidate) {
-          try {
-            await this.rtcPc.addIceCandidate(msg.candidate);
-          } catch {}
+          if (!this.rtcPc.remoteDescription) {
+            this.pendingRtcIce.push(msg.candidate);
+          } else {
+            try { await this.rtcPc.addIceCandidate(msg.candidate); } catch {}
+          }
           return;
         }
 
         if (msg.type === MSG.RELAY_READY) {
-          this.emitLog('中继隧道就绪，正在鉴权...');
+          this.emitLog('服务器就绪，正在鉴权...');
           return;
         }
 
@@ -356,7 +368,7 @@ export class RemoteTransport {
         }
 
         if (msg.type === MSG.AUTH_ERROR && !this.activeChannel) {
-          fail(new Error(msg.error || '配对码错误'));
+          fail(new Error(msg.error || '密码错误'));
           try { ws.close(); } catch {}
           return;
         }
@@ -368,10 +380,11 @@ export class RemoteTransport {
     });
   }
 
-  async #startWebRtcUpgrade(signalingWs, iceServers, pin) {
+  async #startWebRtcUpgrade(signalingWs, iceServers, pin, onConnected) {
     try {
       const pc = new RTCPeerConnection({ iceServers });
       this.rtcPc = pc;
+      this.pendingRtcIce = [];
       const dc = pc.createDataChannel('remotedeck', { ordered: true });
       dc.binaryType = 'arraybuffer';
       this.rtcDc = dc;
@@ -386,14 +399,44 @@ export class RemoteTransport {
       };
 
       dc.onopen = () => {
-        this.emitLog('WebRTC DataChannel 已打开，正在切换 P2P 直连...');
+        this.emitLog('已建立直连');
       };
 
       let authed = false;
+      let videoReceiving = false;
+      pc.ondatachannel = ({ channel: video }) => {
+        if (video.label !== RTC_VIDEO_CHANNEL || !authed || this.activeChannel?.dc !== dc) {
+          video.close();
+          return;
+        }
+        video.binaryType = 'arraybuffer';
+        const assembler = new RtcVideoAssembler();
+        video.onmessage = ({ data }) => {
+          if (this.activeChannel?.dc !== dc || !(data instanceof ArrayBuffer || data instanceof Uint8Array)) return;
+          const frame = assembler.push(data);
+          if (!frame) return;
+          if (!videoReceiving || frame.gap) this.handlers.onVideoDiscontinuity?.();
+          videoReceiving = true;
+          this.#handleBinary(frame.data, FRAME_KIND.VIDEO);
+        };
+        video.onclose = () => {
+          if (this.activeChannel?.dc !== dc || !videoReceiving) return;
+          videoReceiving = false;
+          this.handlers.onVideoDiscontinuity?.();
+          this.sendJson({ type: MSG.SCREEN_CONFIG, forceKey: true });
+        };
+        const ready = () => {
+          if (this.activeChannel?.dc === dc && dc.readyState === 'open') {
+            dc.send(JSON.stringify({ type: RTC_VIDEO_READY, ready: true }));
+          }
+        };
+        video.onopen = ready;
+        if (video.readyState === 'open') ready();
+      };
       dc.onmessage = (ev) => {
         if (typeof ev.data !== 'string') {
           if (authed && this.activeChannel?.dc === dc) {
-            this.#handleBinary(ev.data);
+            this.#handleBinary(ev.data, undefined, videoReceiving ? FRAME_KIND.VIDEO : undefined);
           }
           return;
         }
@@ -407,21 +450,28 @@ export class RemoteTransport {
         }
         if (!authed && msg.type === MSG.AUTH_OK) {
           authed = true;
+          if (this.rtcPc !== pc || this.signalingWs !== signalingWs || this.closed) return;
           const prevChannel = this.activeChannel;
+          if (prevChannel?.kind === 'relay' && prevChannel.ws.readyState === WebSocket.OPEN) {
+            prevChannel.sendText(JSON.stringify({ type: MSG.SCREEN_STOP }));
+            prevChannel.sendText(JSON.stringify({ type: MSG.AUDIO_STOP }));
+            prevChannel.sendText(JSON.stringify({ type: MSG.CLIPBOARD_WATCH, enabled: false }));
+          }
+          this.handlers.onVideoDiscontinuity?.();
+          if (msg.videoEncoder && msg.permissions?.view !== false && this.handlers.onVideoFrame) {
+            dc.send(JSON.stringify({ type: RTC_VIDEO_READY }));
+          }
           this.#activateChannel({
             kind: 'webrtc',
             dc,
             authInfo: msg,
             sendText: (t) => dc.send(t),
             sendBinary: (u8) => dc.send(u8),
-          bufferedAmount: () => dc.bufferedAmount || 0,
+            bufferedAmount: () => dc.bufferedAmount || 0,
             close: () => dc.close(),
-          }, true);
-          if (prevChannel && prevChannel.kind === 'relay') {
-            prevChannel.sendText(JSON.stringify({ type: MSG.SCREEN_STOP }));
-            prevChannel.close();
-          }
-          this.emitLog('已无感升级为 WebRTC P2P 直连');
+          }, Boolean(prevChannel));
+          onConnected();
+          this.emitLog('已切换为 WebRTC 连接');
           return;
         }
         if (authed && this.activeChannel?.dc === dc) {
@@ -449,7 +499,7 @@ export class RemoteTransport {
     this.reconnectAttempt = 0;
     clearTimeout(this.reconnectTimer);
 
-    if (channel.ws) {
+    if (channel.ws && channel.ws !== this.signalingWs) {
       channel.ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           try {
@@ -469,17 +519,14 @@ export class RemoteTransport {
     if (channel.dc) {
       channel.dc.onclose = () => {
         if (this.activeChannel === channel && !this.closed) {
-          this.#handleUnexpectedDrop('P2P 连接已断开');
+          this.#handleUnexpectedDrop('连接已断开');
         }
       };
     }
 
     this.#startTelemetry();
-    if (!isUpgrade) {
-      this.handlers.onAuthenticated?.(channel.authInfo, channel.kind);
-    } else {
-      this.handlers.onChannelUpgrade?.(channel.kind);
-    }
+    this.handlers.onAuthenticated?.(channel.authInfo, channel.kind);
+    if (isUpgrade) this.handlers.onChannelUpgrade?.(channel.kind);
     this.emitStatus('connected', channel.kind);
   }
 
@@ -561,11 +608,11 @@ export class RemoteTransport {
     this.handlers.onMessage?.(msg);
   }
 
-  #handleBinary(raw) {
-    const byteLen = raw?.byteLength || 0;
-    this.bytesThisWindow += byteLen;
+  #handleBinary(raw, onlyKind, ignoredKind) {
     try {
       const env = decodeBinaryEnvelope(raw);
+      if ((onlyKind !== undefined && env.kind !== onlyKind) || env.kind === ignoredKind) return;
+      this.bytesThisWindow += raw?.byteLength || 0;
       if (env.kind === FRAME_KIND.SCREEN) {
         this.framesThisWindow += 1;
         this.handlers.onScreenFrame?.(env.meta, env.payload);

@@ -8,6 +8,8 @@ import {
 } from './HostDeskCard.jsx';
 import { DeskHubView } from './DeskHubView.jsx';
 import { PhoneMirrorPane } from './PhoneMirrorPane.jsx';
+import AccountPane from './AccountPane.jsx';
+import { accountApiBase } from '../lib/account.js';
 
 const STORAGE_RECENT_KEY = 'remotedeck.recent.v1';
 
@@ -58,6 +60,13 @@ function NavIcon({ name }) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
           <rect x="7" y="2" width="10" height="20" rx="2" />
           <path d="M11 18h2" />
+        </svg>
+      );
+    case 'account':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="8" r="3.6" />
+          <path d="M4.5 20c1.6-3.4 4.3-5 7.5-5s5.9 1.6 7.5 5" />
         </svg>
       );
     case 'network':
@@ -112,6 +121,19 @@ export function ConnectView({
   const [showAdvancedRelay, setShowAdvancedRelay] = useState(false);
 
   const hostState = useHostDesk(desktopApi);
+
+  // The server field is intentionally hidden: the page origin is the server.
+  // Inside the desktop app the origin is loopback, so fall back to the public
+  // address the host itself is connected to.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const isLoopback = /^(127\.0\.0\.1|localhost|\[::1\])$/i.test(window.location.hostname);
+    if (!isLoopback) return;
+    const relay = hostState.hostStatus?.relayUrl;
+    if (!relay) return;
+    const http = String(relay).replace(/^ws:/i, 'http:').replace(/^wss:/i, 'https:').replace(/\/ws$/i, '');
+    setServerUrl((cur) => (cur && !/^(https?:\/\/)?(127\.0\.0\.1|localhost)(:|\/|$)/i.test(cur) ? cur : http));
+  }, [hostState.hostStatus?.relayUrl]);
 
   useEffect(() => {
     if (initialPin && typeof window !== 'undefined') {
@@ -329,11 +351,12 @@ export function ConnectView({
       { id: 'devices', label: '设备列表', badge: devices.length > 0 ? devices.length : null },
       { id: 'deskhub', label: '桌面墙', badge: Math.max(devices.length, recent.length) || null },
       { id: 'phones', label: '手机反控', badge: null },
+      { id: 'account', label: '我的', badge: null },
     ];
     if (desktopApi) {
       items.push({
         id: 'network',
-        label: 'P2P 组网',
+        label: '连接方式',
         dotOnline: Boolean(hostState.hostStatus?.tsnet?.tailscaleIp || hostState.hostStatus?.tunnelState === 'ready' || hostState.hostStatus?.relayConnected),
       });
       items.push({ id: 'settings', label: '设置与 AI', badge: null });
@@ -341,24 +364,45 @@ export function ConnectView({
     return items;
   }, [desktopApi, devices.length, recent.length, hostState.hostStatus]);
 
+  const [accountDevices, setAccountDevices] = useState([]);
+
+  useEffect(() => {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('rd_account_token') : '';
+    if (!token) { setAccountDevices([]); return undefined; }
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch(`${accountApiBase()}/api/auth/devices`, {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        const data = await res.json();
+        if (alive && data.ok) setAccountDevices(data.devices || []);
+      } catch {}
+    };
+    load();
+    const timer = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+
   const filteredDevices = useMemo(() => {
     const q = deviceSearch.trim().toLowerCase();
-    if (!q) return devices;
-    return devices.filter(
+    const acctIds = new Set(accountDevices.map((d) => d.deviceId));
+    let list = devices.filter((d) => !acctIds.has(d.deviceId));
+    if (!q) return list;
+    return list.filter(
       (d) =>
         (d.deviceName || '').toLowerCase().includes(q) ||
         (d.deviceId || '').toLowerCase().includes(q) ||
         (d.platform || '').toLowerCase().includes(q),
     );
-  }, [devices, deviceSearch]);
+  }, [devices, deviceSearch, accountDevices]);
 
   const renderConnectControlCard = () => (
     <section className="rd-card rd-connect-hero">
       <div className="rd-card-head">
         <div className="rd-title-group">
           <div>
-            <h2>控制远程设备</h2>
-            <p className="rd-subtitle">输入设备识别码、内网 IP、组网地址或粘贴远程口令</p>
+            <h2>连接</h2>
           </div>
         </div>
         <div className="qr-tabs" style={{ width: 'auto' }}>
@@ -367,21 +411,21 @@ export function ConnectView({
             className={`qr-tab ${mode === 'direct' ? 'active' : ''}`}
             onClick={() => setMode('direct')}
           >
-            直连 / 组网
+            直连
           </button>
           <button
             type="button"
             className={`qr-tab ${mode === 'relay' ? 'active' : ''}`}
             onClick={() => setMode('relay')}
           >
-            中继 ID
+            公网
           </button>
         </div>
       </div>
 
       <form className="connect-form" onSubmit={handleSubmit}>
         <label className="field">
-          <span>远程设备识别码或口令 URL</span>
+          <span>设备识别码或口令</span>
           <input
             type="text"
             className="rd-hero-input"
@@ -404,52 +448,28 @@ export function ConnectView({
               }
               setDeviceId(looksLikeAddress(v) ? v.trim() : v.toUpperCase());
             }}
-            placeholder="例如 RD-4829-7310 或 http://192.168.x.x:9601"
+            placeholder="RD-0000-0000"
             required={mode === 'relay'}
           />
         </label>
 
         <label className="field">
-          <span>访问配对码 (PIN)</span>
+          <span>访问密码</span>
           <input
             type="password"
             className="rd-hero-input"
             value={pin}
             onChange={(e) => setPin(e.target.value.toUpperCase())}
-            placeholder="输入被控端显示的 8 位临时密码"
+            placeholder="8 位密码"
             autoComplete="current-password"
             required
           />
         </label>
 
-        {(mode === 'relay' || showAdvancedRelay) && (
-          <label className="field">
-            <span>{mode === 'relay' ? '中继服务器地址' : '自定义直连 / 隧道网关地址'}</span>
-            <input
-              type="text"
-              value={serverUrl}
-              onChange={(e) => setServerUrl(e.target.value.trim())}
-              placeholder="https://relay.example.com"
-            />
-          </label>
-        )}
-
-        <div className="rd-form-meta-row">
-          {mode !== 'relay' && (
-            <button
-              type="button"
-              className="btn-ghost btn-xs advanced-toggle"
-              onClick={() => setShowAdvancedRelay((v) => !v)}
-            >
-              {showAdvancedRelay ? '收起目标网关地址' : '指定隧道 / 网关地址（可选）'}
-            </button>
-          )}
-        </div>
-
         {errorMsg && <div className="alert-error">{errorMsg}</div>}
 
         <button type="submit" className="btn-primary btn-lg rd-connect-cta" disabled={connecting}>
-          {connecting ? '正在建立安全会话...' : '连接远程桌面'}
+          {connecting ? '连接中...' : '连接'}
         </button>
       </form>
 
@@ -495,7 +515,6 @@ export function ConnectView({
       onClick={() => handlePickDevice(dev)}
     >
       <div className="rd-device-card-top">
-        <div className="rd-device-os-badge">{(dev.platform || 'PC').toUpperCase()}</div>
         <div className="rd-device-title-col">
           <div className="device-title">
             <span className={`dot ${dev.online ? 'online' : ''}`} />
@@ -503,22 +522,12 @@ export function ConnectView({
           </div>
           <div className="device-sub">
             <span>{dev.deviceId}</span>
-            {dev.displays?.[0] && (
-              <span>{dev.displays[0].width}×{dev.displays[0].height}</span>
-            )}
           </div>
         </div>
       </div>
 
-      <div className="device-tags">
-        {dev.lanEndpoints?.some((e) => e.kind === 'lan') && <span className="mini-tag">局域网</span>}
-        {dev.lanEndpoints?.some((e) => e.kind === 'tailscale') && <span className="mini-tag tag-ok">P2P 组网</span>}
-        {dev.lanEndpoints?.some((e) => e.family === 6) && <span className="mini-tag">IPv6</span>}
-        {dev.tunnelUrl && <span className="mini-tag">外网隧道</span>}
-      </div>
-
       <div className="rd-device-card-foot">
-        <span className="rd-device-status-txt">{dev.online !== false ? '在线可用' : '离线'}</span>
+        <span className="rd-device-status-txt">{dev.online !== false ? '在线' : '离线'}</span>
         <button
           type="button"
           className="btn-primary btn-xs"
@@ -540,7 +549,7 @@ export function ConnectView({
           <img src="/icon.svg" alt="RemoteDeck" className="brand-icon" />
           <div className="rd-brand-text">
             <strong>RemoteDeck</strong>
-            <span>全平台 P2P 远控</span>
+            <span>远程控制</span>
           </div>
         </div>
 
@@ -576,13 +585,12 @@ export function ConnectView({
               <span className="dot online" />
               <div className="rd-self-info">
                 <strong>Web 控制端</strong>
-                <small>跨端 PWA 就绪</small>
+                <small>在线</small>
               </div>
             </div>
           )}
 
           <div className="rd-tier-row">
-            <span className="tier-badge">{tier.toUpperCase()}</span>
             <select
               className="compact-select"
               value={layoutOverride}
@@ -590,9 +598,9 @@ export function ConnectView({
               aria-label="界面适配模式"
             >
               <option value="auto">自适应</option>
-              <option value="desktop">桌面视图</option>
-              <option value="tablet">平板视图</option>
-              <option value="phone">手机视图</option>
+              <option value="desktop">桌面</option>
+              <option value="tablet">平板</option>
+              <option value="phone">手机</option>
             </select>
           </div>
         </div>
@@ -605,7 +613,7 @@ export function ConnectView({
               <img src="/icon.svg" alt="RemoteDeck" className="brand-icon" />
               <div>
                 <h1>RemoteDeck</h1>
-                <p>P2P 组网 · 多端远控</p>
+                <p>远程控制</p>
               </div>
             </div>
             <div className="tier-pill-group">
@@ -640,8 +648,7 @@ export function ConnectView({
                     <div className="rd-card-head">
                       <div className="rd-title-group">
                         <div>
-                          <h2>在线设备 ({devices.length})</h2>
-                          <p className="rd-subtitle">同局域网 / P2P 组网 / 公网 IPv6 自动发现</p>
+                          <h2>设备 ({devices.length})</h2>
                         </div>
                       </div>
                       <button type="button" className="btn-secondary btn-xs" onClick={fetchDevices}>
@@ -650,8 +657,8 @@ export function ConnectView({
                     </div>
                     {devices.length === 0 ? (
                       <div className="empty-box">
-                        <p>暂未发现当前网络下的在线电脑。</p>
-                        <small>可在右侧直接输入设备 ID、IP 或粘贴远程口令连接。</small>
+                        <p>没有在线设备</p>
+                        <small>输入设备 ID 或扫码</small>
                       </div>
                     ) : (
                       <div className="device-list">
@@ -665,13 +672,9 @@ export function ConnectView({
                               <div className="device-title">
                                 <span className={`dot ${dev.online ? 'online' : ''}`} />
                                 <strong>{dev.deviceName || dev.deviceId}</strong>
-                                <span className="tag">{dev.platform}</span>
                               </div>
                               <div className="device-sub">
                                 <span>{dev.deviceId}</span>
-                                {dev.displays?.[0] && (
-                                  <span>{dev.displays[0].width}×{dev.displays[0].height}</span>
-                                )}
                               </div>
                             </div>
                             <button
@@ -699,13 +702,12 @@ export function ConnectView({
                   <div className="rd-card-head">
                     <div className="rd-title-group">
                       <div>
-                        <h3>已发现的局域网 / 组网设备 ({devices.length})</h3>
-                        <p className="rd-subtitle">同网络、同 Tailscale 账号或配置了同中继的设备会在此出现</p>
+                        <h3>设备 ({devices.length})</h3>
                       </div>
                     </div>
                     <div className="rd-head-actions">
                       <button type="button" className="btn-secondary btn-xs" onClick={fetchDevices}>
-                        {loadingDevices ? '扫描中...' : '扫描局域网'}
+                        {loadingDevices ? '扫描中...' : '扫描'}
                       </button>
                       <button type="button" className="btn-ghost btn-xs" onClick={() => setWorkspaceTab('devices')}>
                         查看全部 →
@@ -730,8 +732,7 @@ export function ConnectView({
             <div className="rd-section-stack">
               <div className="rd-page-head">
                 <div>
-                  <h2>设备列表与历史记录</h2>
-                  <p>查看局域网、Tailscale P2P 组网及历史记忆设备，点击即可免密/输码远程</p>
+                  <h2>设备与历史</h2>
                 </div>
                 <div className="rd-head-actions">
                   <input
@@ -747,10 +748,48 @@ export function ConnectView({
                 </div>
               </div>
 
+              {accountDevices.length > 0 && (
+                <section className="rd-card">
+                  <div className="rd-card-head">
+                    <h3>我的设备 ({accountDevices.length})</h3>
+                  </div>
+                  <div className="device-list">
+                    {accountDevices.map((dev) => (
+                      <div key={dev.deviceId} className="device-item">
+                        <div className="device-main">
+                          <div className="device-title">
+                            <span className={`dot ${dev.online ? 'online' : ''}`} />
+                            <strong>{dev.name || dev.deviceId}</strong>
+                          </div>
+                          <div className="device-sub">
+                            <span>{dev.deviceId}</span>
+                            <span>{dev.online ? '在线' : '离线'}</span>
+                          </div>
+                        </div>
+                        {dev.deviceId === hostState.hostStatus?.deviceId ? (
+                          <span className="rd-self-badge">本机</span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-primary btn-xs"
+                            disabled={!dev.online}
+                            onClick={() => {
+                              setDeviceId(dev.deviceId);
+                              setPromptTarget({ deviceId: dev.deviceId, deviceName: dev.name || dev.deviceId, mode: 'relay', serverUrl: serverUrl.trim(), fallbackUrl: '' });
+                            }}
+                          >
+                            连接
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
               {filteredDevices.length === 0 ? (
                 <div className="rd-card empty-box">
-                  <p>当前未扫描到在线远端设备</p>
-                  <small>确认目标主机已启动 RemoteDeck 且处于同一局域网、同一 Tailscale 账号或已接入同一中继。</small>
+                  <p>没有扫描到在线设备</p>
                 </div>
               ) : (
                 <div className="rd-device-grid">
@@ -771,7 +810,7 @@ export function ConnectView({
                         onClick={() => handlePickRecent(item)}
                       >
                         <div className="rd-device-card-top">
-                          <div className="rd-device-os-badge">{item.mode === 'relay' ? '中继' : '直连'}</div>
+                          <div className="rd-device-os-badge">{item.mode === 'relay' ? '公网' : '局域网'}</div>
                           <div className="rd-device-title-col">
                             <div className="device-title">
                               <span className={`dot ${recentOnlineMap[item.deviceId] ? 'online' : ''}`} />
@@ -808,6 +847,34 @@ export function ConnectView({
           )}
 
           {workspaceTab === 'phones' && <PhoneMirrorPane />}
+          {workspaceTab === 'account' && (
+            <AccountPane
+              selfDevice={
+                desktopApi && hostState.hostStatus
+                  ? {
+                      deviceId: hostState.hostStatus.deviceId,
+                      name: hostState.hostStatus.deviceName || '电脑',
+                      platform: 'win32',
+                      kind: 'pc',
+                    }
+                  : {
+                      deviceId: `WEB-${(typeof window !== 'undefined' ? window.location.hostname : 'web')}`,
+                      name: '网页',
+                      platform: 'web',
+                      kind: 'web',
+                    }
+              }
+              onConnectDevice={(id) => {
+                const dev = devices.find((d) => d.deviceId === id);
+                if (dev && dev.online !== false) {
+                  handlePickDevice(dev);
+                  return;
+                }
+                setPromptTarget({ deviceId: id, deviceName: id, mode: 'relay', serverUrl: serverUrl.trim(), fallbackUrl: '' });
+                setWorkspaceTab('home');
+              }}
+            />
+          )}
 
           {workspaceTab === 'network' && desktopApi && (
             <HostNetworkPanel desktopApi={desktopApi} state={hostState} />
@@ -870,7 +937,7 @@ export function ConnectView({
                 type="password"
                 value={promptPin}
                 onChange={(e) => setPromptPin(e.target.value.toUpperCase())}
-                placeholder="输入 8 位配对码（连接一次后自动记住）"
+                placeholder="8 位密码"
                 autoFocus
                 required
               />

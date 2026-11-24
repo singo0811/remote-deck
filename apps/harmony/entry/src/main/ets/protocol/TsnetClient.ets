@@ -135,13 +135,17 @@ export class TsnetClient {
           logs.push(rawLogs[i] as string);
         }
       }
+      // tsnet reports warming-up as health warnings while the node starts; that is
+      // normal progress, not a failure worth showing in red.
+      const rawError = jsonStr(obj, 'lastError');
+      const lastError = /warming-up|is starting|Please wait/i.test(rawError) ? '' : rawError;
       return {
         enabled: jsonBool(obj, 'enabled', false),
         state: jsonStr(obj, 'state', 'Stopped'),
         tailscaleIp: jsonStr(obj, 'tailscaleIp'),
         hostname: jsonStr(obj, 'hostname'),
         authUrl: jsonStr(obj, 'authUrl'),
-        lastError: jsonStr(obj, 'lastError'),
+        lastError,
         peers,
         logs,
       };

@@ -109,6 +109,7 @@ export interface AuthOkInfo {
   channel: string;
   displays: DisplayInfo[];
   permissions: PermissionsInfo;
+  inputAcknowledgements?: boolean;
   lanEndpoints?: LanEndpoint[];
   tunnelUrl?: string;
 }
@@ -347,6 +348,7 @@ export interface OutMsgMouse {
   y: number;
   button: string;
   delta: number;
+  inputId?: number;
 }
 
 export interface OutMsgWheel {

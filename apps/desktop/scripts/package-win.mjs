@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../../..');
 const electronDist = path.join(repoRoot, 'node_modules/electron/dist');
-const outDir = path.join(repoRoot, 'dist/RemoteDeck-win32-x64');
+const customOutput = process.argv[2];
+const outDir = customOutput ? path.resolve(customOutput) : path.join(repoRoot, 'dist/RemoteDeck-win32-x64');
 const appDir = path.join(outDir, 'resources/app');
 
 if (!existsSync(electronDist)) {
@@ -24,8 +25,12 @@ if (!existsSync(path.join(webDist, 'index.html'))) {
 }
 
 console.log(`Packaging RemoteDeck -> ${outDir}`);
-await fs.rm(outDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
-await fs.mkdir(outDir, { recursive: true });
+if (customOutput) {
+  await fs.mkdir(outDir);
+} else {
+  await fs.rm(outDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  await fs.mkdir(outDir, { recursive: true });
+}
 
 // 1. Copy Electron runtime and rename electron.exe -> RemoteDeck.exe
 await fs.cp(electronDist, outDir, { recursive: true });
@@ -51,6 +56,7 @@ await fs.writeFile(
 );
 
 await fs.cp(path.join(repoRoot, 'apps/desktop/src'), path.join(appDir, 'apps/desktop/src'), { recursive: true });
+await fs.cp(path.join(repoRoot, 'apps/desktop/assets'), path.join(appDir, 'apps/desktop/assets'), { recursive: true });
 await fs.cp(webDist, path.join(appDir, 'apps/web/dist'), { recursive: true });
 
 // Copy workspace packages into node_modules/@remote-deck/* (physical copies, no symlinks)

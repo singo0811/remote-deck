@@ -7,7 +7,7 @@ import path from 'node:path';
 
 const { app, BrowserWindow } = electron;
 const HOST = 'http://127.0.0.1:9601';
-const PIN = process.env.RD_PIN || '8A5ZH4QD';
+const PIN = process.env.RD_PIN || '';
 const DEVICE = process.env.RD_DEVICE || 'RD-5852-4865';
 const outDir = path.resolve('dist');
 

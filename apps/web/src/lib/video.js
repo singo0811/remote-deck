@@ -3,6 +3,16 @@
  * ffmpeg pipeline straight onto the remote canvas. Any failure falls back to the
  * JPEG stream (the caller switches codec back to 'jpeg').
  */
+function avcCodecFromKeyframe(bytes) {
+  for (let i = 0; i + 6 < bytes.length; i += 1) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1 && (bytes[i + 3] & 31) === 7) {
+      const profile = bytes.subarray(i + 4, i + 7);
+      return `avc1.${Array.from(profile, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+    }
+  }
+  return 'avc1.42E01E';
+}
+
 export class H264Player {
   constructor() {
     this.decoder = null;
@@ -45,8 +55,8 @@ export class H264Player {
     this.waitingForKey = true;
   }
 
-  configure(width, height) {
-    const key = `${width}x${height}`;
+  configure(width, height, codec) {
+    const key = `${width}x${height}:${codec}`;
     if (this.decoder && this.configKey === key) return true;
     this.reset();
     try {
@@ -58,7 +68,7 @@ export class H264Player {
         },
       });
       decoder.configure({
-        codec: 'avc1.42E01E',
+        codec,
         avc: { format: 'annexb' },
         codedWidth: width,
         codedHeight: height,
@@ -106,11 +116,11 @@ export class H264Player {
     if (!bytes || bytes.byteLength === 0) return false;
     const width = Number(meta?.width) || 0;
     const height = Number(meta?.height) || 0;
-    if (width > 0 && height > 0 && this.configKey !== `${width}x${height}`) {
-      if (!this.configure(width, height)) return false;
+    const isKey = Boolean(meta?.key);
+    if (isKey && width > 0 && height > 0) {
+      if (!this.configure(width, height, avcCodecFromKeyframe(bytes))) return false;
     }
     if (!this.decoder) return false;
-    const isKey = Boolean(meta?.key);
     if (this.waitingForKey) {
       if (!isKey) return false;
       this.waitingForKey = false;

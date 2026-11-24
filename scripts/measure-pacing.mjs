@@ -3,7 +3,7 @@
 import { WebSocket } from 'ws';
 import { MSG, FRAME_KIND, computeChallengeProof, decodeBinaryEnvelope } from '../packages/shared/src/index.mjs';
 
-const PIN = process.env.RD_PIN || '8A5ZH4QD';
+const PIN = process.env.RD_PIN || '';
 const ws = new WebSocket('ws://127.0.0.1:9601/ws');
 ws.binaryType = 'arraybuffer';
 

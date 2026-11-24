@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { MSG, buildIceServers } from '@remote-deck/shared';
+import { createAccountStore, sendLoginCodeEmail } from './accounts.mjs';
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -32,6 +33,10 @@ export function createRelayServer(options = {}) {
   const webDistDir = options.webDistDir ? path.resolve(options.webDistDir) : null;
   const iceServers = buildIceServers(options.iceServers);
   const startedAt = Date.now();
+  const accounts = createAccountStore({
+    dataDir: options.dataDir ?? process.env.RELAY_DATA_DIR ?? '',
+    secret: options.accountSecret ?? process.env.ACCOUNT_SECRET ?? '',
+  });
 
   /** @type {Map<string, any>} */
   const devices = new Map(); // deviceId -> device record
@@ -91,8 +96,8 @@ export function createRelayServer(options = {}) {
 
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader('access-control-allow-origin', '*');
-    res.setHeader('access-control-allow-methods', 'GET, OPTIONS');
-    res.setHeader('access-control-allow-headers', 'Content-Type');
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
@@ -109,6 +114,131 @@ export function createRelayServer(options = {}) {
         activeSessions: sessions.size,
         uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
       }));
+      return;
+    }
+
+    if (url.pathname.startsWith('/api/auth/')) {
+      const action = url.pathname.slice('/api/auth/'.length);
+      const readBody = () => new Promise((resolve) => {
+        let raw = '';
+        req.on('data', (chunk) => { raw += chunk; if (raw.length > 8192) req.destroy(); });
+        req.on('end', () => {
+          try { resolve(JSON.parse(raw || '{}')); } catch { resolve({}); }
+        });
+        req.on('error', () => resolve({}));
+      });
+      const json = (status, body) => {
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(body));
+      };
+      const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+
+      if (action === 'register' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.register(body.username, body.password, body.code);
+        json(result.ok ? 200 : 400, result);
+        return;
+      }
+      if (action === 'login' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.login(body.username, body.password);
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      if (action === 'email/code' && req.method === 'POST') {
+        const body = await readBody();
+        const issued = accounts.issueEmailCode(body.email);
+        if (!issued.ok) { json(400, issued); return; }
+        const sent = await sendLoginCodeEmail({
+          to: issued.email,
+          code: issued.code,
+          apiUrl: process.env.EMAIL_API_URL || '',
+          apiKey: process.env.EMAIL_API_KEY || '',
+          from: process.env.EMAIL_FROM || '',
+        });
+        json(sent.ok ? 200 : 503, sent.ok ? { ok: true } : { ok: false, error: sent.error });
+        return;
+      }
+      if (action === 'email/verify' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.verifyEmailCode(body.email, body.code);
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      if (action === 'wechat/start' && req.method === 'GET') {
+        const appId = process.env.WECHAT_APP_ID || '';
+        if (!appId) { json(503, { ok: false, error: '微信登录未配置' }); return; }
+        const redirect = `${url.origin}/api/auth/wechat/callback`;
+        const target = new URL('https://open.weixin.qq.com/connect/qrconnect');
+        target.searchParams.set('appid', appId);
+        target.searchParams.set('redirect_uri', redirect);
+        target.searchParams.set('response_type', 'code');
+        target.searchParams.set('scope', 'snsapi_login');
+        target.searchParams.set('state', crypto.randomBytes(8).toString('hex'));
+        res.writeHead(302, { location: target.toString() });
+        res.end();
+        return;
+      }
+      if (action === 'wechat/callback' && req.method === 'GET') {
+        const appId = process.env.WECHAT_APP_ID || '';
+        const appSecret = process.env.WECHAT_APP_SECRET || '';
+        const code = url.searchParams.get('code') || '';
+        if (!appId || !appSecret || !code) {
+          res.writeHead(302, { location: '/?login=wechat_failed' });
+          res.end();
+          return;
+        }
+        try {
+          const tokenRes = await fetch(
+            'https://api.weixin.qq.com/sns/oauth2/access_token' +
+              `?appid=${encodeURIComponent(appId)}&secret=${encodeURIComponent(appSecret)}` +
+              `&code=${encodeURIComponent(code)}&grant_type=authorization_code`,
+            { signal: AbortSignal.timeout(10000) },
+          );
+          const tokenJson = await tokenRes.json();
+          const openid = tokenJson?.openid;
+          if (!openid) throw new Error(tokenJson?.errmsg || '微信授权失败');
+          const result = accounts.loginWithWechat(openid, '');
+          res.writeHead(302, { location: `/?account_token=${encodeURIComponent(result.token)}` });
+          res.end();
+        } catch {
+          res.writeHead(302, { location: '/?login=wechat_failed' });
+          res.end();
+        }
+        return;
+      }
+      if (action === 'device' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.upsertDevice(token, body);
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      if (action === 'devices' && req.method === 'GET') {
+        const result = accounts.listDevices(token, (id) => {
+          const dev = devices.get(id);
+          return Boolean(dev && dev.controlWs && dev.controlWs.readyState === WebSocket.OPEN);
+        });
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      if (action === 'me' && req.method === 'GET') {
+        const user = accounts.auth(token);
+        json(user ? 200 : 401, user ? { ok: true, user } : { ok: false, error: '未登录' });
+        return;
+      }
+      if (action === 'bind' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.bindDevice(token, body.deviceId);
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      if (action === 'unbind' && req.method === 'POST') {
+        const body = await readBody();
+        const result = accounts.unbindDevice(token, body.deviceId);
+        json(result.ok ? 200 : 401, result);
+        return;
+      }
+      json(404, { ok: false, error: '未知接口' });
       return;
     }
 
@@ -386,6 +516,7 @@ export function createRelayServer(options = {}) {
     devices,
     sessions,
     async start() {
+      await accounts.init();
       await new Promise((resolve, reject) => {
         httpServer.once('error', reject);
         httpServer.listen(port, host, () => {

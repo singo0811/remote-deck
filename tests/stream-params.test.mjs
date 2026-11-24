@@ -19,8 +19,9 @@ test('relay/tunnel cap resolution, fps and bitrate-defining quality', () => {
   assert.ok(relay.quality < 92, `relay quality ${relay.quality}`);
 
   const tunnel = effectiveStreamParams(uhd, { abrLevel: 0, channel: 'tunnel' });
-  assert.ok(tunnel.maxWidth <= 1440, `tunnel width ${tunnel.maxWidth}`);
-  assert.ok(tunnel.quality < relay.quality, 'tunnel must be leaner than relay');
+  assert.equal(tunnel.maxWidth, 1920);
+  assert.equal(tunnel.fps, 18);
+  assert.ok(tunnel.quality > relay.quality && tunnel.quality < uhd.quality);
 });
 
 test('the worst channel wins when several clients watch', () => {

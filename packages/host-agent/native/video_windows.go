@@ -10,11 +10,10 @@ import (
 )
 
 var (
-	videoEncoderName = "unknown"
-	nvencOnce        sync.Once
-	nvencFastOK      bool
-	qsvOnce          sync.Once
-	qsvOK            bool
+	nvencOnce   sync.Once
+	nvencFastOK bool
+	qsvOnce     sync.Once
+	qsvOK       bool
 )
 
 // Intel Quick Sync: hardware H.264 without touching the CPU. MiniRTC-style
@@ -112,6 +111,9 @@ func startVideoEncoder(w, h, fps, quality int) error {
 			"-preset", "veryfast",
 			"-global_quality", fmt.Sprintf("%d", crf),
 			"-look_ahead", "0",
+			"-async_depth", "1",
+			"-bf", "0",
+			"-idr_interval", "0",
 			"-b:v", fmt.Sprintf("%dk", kbps),
 			"-maxrate", fmt.Sprintf("%dk", maxKbps),
 			"-bufsize", fmt.Sprintf("%dk", bufKbps),
@@ -167,5 +169,5 @@ func startVideoEncoder(w, h, fps, quality int) error {
 	}
 	args = append(args, encoderArgs...)
 	args = append(args, "-flush_packets", "1", "-f", "h264", "pipe:1")
-	return startFfmpegVideoCmd(args, true, w, h, fps)
+	return startFfmpegVideoCmd(args, true, w, h, fps, kbps)
 }

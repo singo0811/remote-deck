@@ -311,8 +311,10 @@ int32_t H264DecoderEngine::PushFrame(const uint8_t* data, size_t len, int64_t pt
         // Drop any unconsumed older P-frames so latency stays tight.
         s.pendingPackets.clear();
     } else if (s.pendingPackets.size() >= 6) {
-        // Bounded backlog guard under decode spike.
-        s.pendingPackets.pop_front();
+        // Discard the broken prediction chain and resume at an IDR.
+        s.pendingPackets.clear();
+        s.waitingForKeyFrame = true;
+        return 2;
     }
     s.pendingPackets.push_back(std::move(pkt));
     s.queueCv.notify_one();

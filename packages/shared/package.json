@@ -8,6 +8,7 @@
     ".": "./src/index.mjs",
     "./protocol": "./src/protocol.mjs",
     "./auth": "./src/auth.mjs",
-    "./network": "./src/network.mjs"
+    "./network": "./src/network.mjs",
+    "./rtc-video": "./src/rtc-video.mjs"
   }
 }

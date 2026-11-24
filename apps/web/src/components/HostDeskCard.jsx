@@ -1,6 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 
+/** Public host (domain[:port]) the host is reachable at, or '' when offline. */
+export function publicAddressOf(hostStatus) {
+  const raw = hostStatus?.tunnelUrl || hostStatus?.relayUrl || '';
+  if (!raw) return '';
+  try {
+    const url = new URL(String(raw).replace(/^ws:/i, 'http:').replace(/^wss:/i, 'https:'));
+    return url.host;
+  } catch {
+    return '';
+  }
+}
+
 export function useHostDesk(desktopApi) {
   const [hostStatus, setHostStatus] = useState(null);
   const [showPin, setShowPin] = useState(true);
@@ -273,8 +285,7 @@ export function HostHeroPanel({ desktopApi, state, onOpenSection }) {
         <div className="rd-title-group">
           <span className="dot online" />
           <div>
-            <h2>允许远程本机</h2>
-            <p className="rd-subtitle">此设备已就绪，可通过识别码或扫码接入</p>
+            <h2>本机</h2>
           </div>
         </div>
         <div className="rd-head-actions">
@@ -347,23 +358,20 @@ export function HostHeroPanel({ desktopApi, state, onOpenSection }) {
           </div>
 
           <div className="rd-channel-strip">
-            {primaryLanIp && <span className="link-badge badge-lan">局域网 {primaryLanIp}</span>}
-            {ipv6Count > 0 && <span className="link-badge badge-p2p">IPv6 双栈</span>}
+            {primaryLanIp && <span className="link-badge badge-lan">局域网</span>}
             <button
               type="button"
               className={`link-badge badge-btn ${hostStatus.tsnet?.tailscaleIp ? 'badge-lan' : 'badge-muted'}`}
               onClick={() => onOpenSection?.('network')}
-              title="配置内嵌 Tailscale P2P 组网"
             >
-              {hostStatus.tsnet?.tailscaleIp ? `组网 ${hostStatus.tsnet.tailscaleIp}` : 'P2P 组网未开'}
+              组网
             </button>
             <button
               type="button"
-              className={`link-badge badge-btn ${hostStatus.tunnelState === 'ready' ? 'badge-relay' : 'badge-muted'}`}
+              className={`link-badge badge-btn ${hostStatus?.tunnelUrl || hostStatus?.relayConnected ? 'badge-relay' : 'badge-muted'}`}
               onClick={() => onOpenSection?.('network')}
-              title="配置 Cloudflare 公网隧道 / 中继"
             >
-              {hostStatus.tunnelState === 'ready' ? '公网隧道就绪' : '公网隧道'}
+              公网
             </button>
           </div>
 
@@ -409,7 +417,7 @@ export function HostHeroPanel({ desktopApi, state, onOpenSection }) {
               className={`qr-tab ${qrTarget === 'lan' ? 'active' : ''}`}
               onClick={() => setQrTarget('lan')}
             >
-              内网
+              局域网
             </button>
             {meshShareUrl && (
               <button
@@ -425,16 +433,15 @@ export function HostHeroPanel({ desktopApi, state, onOpenSection }) {
               className={`qr-tab ${qrTarget === 'wan' ? 'active' : ''}`}
               onClick={() => setQrTarget('wan')}
               disabled={!wanShareUrl}
-              title={wanShareUrl ? '切换到外网扫码' : '开启公网隧道或中继后可用'}
             >
-              外网
+              公网
             </button>
           </div>
 
           {qrDataUrl ? (
-            <img src={qrDataUrl} alt="扫码远程控制二维码" className="qr-img" />
+            <img className="qr-img" src={qrDataUrl} alt="连接二维码" />
           ) : (
-            <div className="qr-placeholder">等待二维码就绪...</div>
+            <div className="qr-placeholder">二维码</div>
           )}
 
           <button
@@ -442,15 +449,8 @@ export function HostHeroPanel({ desktopApi, state, onOpenSection }) {
             className="btn-secondary btn-xs rd-qr-copy"
             onClick={() => copyText(activeQrUrl, '连接口令')}
           >
-            复制连接口令
+            复制口令
           </button>
-          <small className="qr-hint">
-            {qrTarget === 'wan' && wanShareUrl
-              ? '外网扫码直连'
-              : qrTarget === 'mesh' && meshShareUrl
-                ? 'Tailscale P2P 组网直连'
-                : '手机端扫一扫立即控制'}
-          </small>
         </div>
       </div>
     </section>
@@ -483,8 +483,7 @@ export function HostNetworkPanel({ desktopApi, state }) {
     <div className="rd-section-stack">
       <div className="rd-page-head">
         <div>
-          <h2>P2P 组网与穿透通道</h2>
-          <p>配置免安装内嵌 Tailscale P2P 组网、Cloudflare 公网隧道与 CrossDesk 自建中继</p>
+          <h2>连接方式</h2>
         </div>
         {copiedMsg && <span className="copied-pill">{copiedMsg}</span>}
       </div>
@@ -495,8 +494,7 @@ export function HostNetworkPanel({ desktopApi, state }) {
             <div className="rd-title-group">
               <span className={`dot ${hostStatus.tsnet?.tailscaleIp ? 'online' : ''}`} />
               <div>
-                <h3>内嵌 Tailscale P2P 组网</h3>
-                <p className="rd-subtitle">手机与电脑直连打洞，无需单独安装 VPN</p>
+                <h3>组网</h3>
               </div>
             </div>
             {desktopApi.setTsnetConfig && hostStatus.tsnet?.available !== false && (
@@ -512,95 +510,27 @@ export function HostNetworkPanel({ desktopApi, state }) {
           </div>
 
           {hostStatus.tsnet?.enabled ? (
-            <div className="host-subpanel">
-              <div className="svc-head">
-                <span className="cred-label">节点状态</span>
-                <span className={`link-badge ${hostStatus.tsnet.tailscaleIp ? 'badge-lan' : 'badge-relay'}`}>
-                  {hostStatus.tsnet.tailscaleIp
-                    ? `在线 · ${hostStatus.tsnet.tailscaleIp}`
-                    : hostStatus.tsnet.authUrl
-                      ? '等待浏览器授权登录'
-                      : hostStatus.tsnet.state || 'Starting'}
-                </span>
-              </div>
-
-              {hostStatus.tsnet.lastError && (
-                <div className="alert-warn">{hostStatus.tsnet.lastError}</div>
-              )}
-
+            <div className="svc-head">
+              <span className={`link-badge ${hostStatus.tsnet.tailscaleIp ? 'badge-lan' : 'badge-relay'}`}>
+                {hostStatus.tsnet.tailscaleIp ? '在线' : hostStatus.tsnet.authUrl ? '待授权' : '连接中'}
+              </span>
               {hostStatus.tsnet.authUrl ? (
-                <div className="svc-box">
-                  <div className="tunnel-cfg-actions" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                    {tsAuthQrUrl && (
-                      <img src={tsAuthQrUrl} alt="Tailscale 登录二维码" className="rd-mini-qr" />
-                    )}
-                    <a
-                      href={hostStatus.tsnet.authUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-primary btn-xs"
-                      style={{ textDecoration: 'none' }}
-                    >
-                      浏览器授权登录
-                    </a>
-                    <button
-                      type="button"
-                      className="btn-secondary btn-xs"
-                      onClick={() => copyText(hostStatus.tsnet.authUrl, 'Tailscale 登录链接')}
-                    >
-                      复制链接
-                    </button>
-                  </div>
-                </div>
+                <a
+                  href={hostStatus.tsnet.authUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="btn-primary btn-xs"
+                  style={{ textDecoration: 'none' }}
+                >
+                  登录
+                </a>
               ) : hostStatus.tsnet.tailscaleIp ? (
-                <div className="svc-box">
-                  <div className="svc-head">
-                    <small>
-                      主机名：{hostStatus.tsnet.hostname} · 在线同账号节点 {peers.filter((p) => p.online).length} 台
-                    </small>
-                    <button type="button" className="btn-danger-ghost btn-xs" onClick={() => desktopApi.logoutTsnet?.()}>
-                      退出账号
-                    </button>
-                  </div>
-                  {peers.length > 0 && (
-                    <div className="rd-peer-list">
-                      {peers.slice(0, 6).map((p) => (
-                        <div key={`${p.id}-${p.ip}`} className="rd-peer-row">
-                          <span className={`dot ${p.online ? 'online' : ''}`} />
-                          <strong className="rd-peer-name">{p.name || p.ip}</strong>
-                          <code className="rd-peer-ip">{p.ip}</code>
-                          <span className="tag">{p.curAddr ? 'P2P' : p.relay ? `DERP:${p.relay}` : p.online ? '在线' : '离线'}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <small className="rd-muted-note">正在连接 Tailscale 协调服务器...</small>
-              )}
-
-              {!hostStatus.tsnet.tailscaleIp && (
-                <div className="tunnel-cfg-actions">
-                  <input
-                    type="password"
-                    className="rd-inline-input"
-                    value={tsnetAuthKey}
-                    onChange={(e) => setTsnetAuthKey(e.target.value)}
-                    placeholder="可选：Auth Key (tskey-auth-...)"
-                  />
-                  <button
-                    type="button"
-                    className="btn-secondary btn-xs"
-                    onClick={() => desktopApi.setTsnetConfig({ enabled: true, authKey: tsnetAuthKey })}
-                  >
-                    应用 Key
-                  </button>
-                </div>
-              )}
+                <button type="button" className="btn-ghost btn-xs" onClick={() => desktopApi.logoutTsnet?.()}>
+                  退出
+                </button>
+              ) : null}
             </div>
-          ) : (
-            <p className="rd-muted-note">开启后电脑与鸿蒙端登录同一 Tailscale 账号，即可跨网 P2P 打洞直连。</p>
-          )}
+          ) : null}
         </section>
 
         <section className="rd-card rd-feature-card">
@@ -608,8 +538,7 @@ export function HostNetworkPanel({ desktopApi, state }) {
             <div className="rd-title-group">
               <span className={`dot ${hostStatus.tunnelState === 'ready' ? 'online' : ''}`} />
               <div>
-                <h3>Cloudflare 公网隧道</h3>
-                <p className="rd-subtitle">即开即用外网 HTTPS/WSS 穿透</p>
+                <h3>临时隧道</h3>
               </div>
             </div>
             <label className="toggle-chip compact-chip">
@@ -679,7 +608,7 @@ export function HostNetworkPanel({ desktopApi, state }) {
               )}
             </div>
           ) : (
-            <p className="rd-muted-note">未开启外网临时隧道。适合没有公网 IP 或同网段时临时外网远程访问。</p>
+            <p className="rd-muted-note">未开启</p>
           )}
         </section>
 
@@ -689,8 +618,7 @@ export function HostNetworkPanel({ desktopApi, state }) {
               <div className="rd-title-group">
                 <span className={`dot ${hostStatus.relayConnected ? 'online' : ''}`} />
                 <div>
-                  <h3>自建中继 / 信令 (CrossDesk)</h3>
-                  <p className="rd-subtitle">WebRTC P2P 打洞信令与 TURN/WS 兜底</p>
+                  <h3>公网</h3>
                 </div>
               </div>
               <span className={`link-badge ${hostStatus.relayConnected ? 'badge-lan' : 'badge-err'}`}>
@@ -698,44 +626,17 @@ export function HostNetworkPanel({ desktopApi, state }) {
               </span>
             </div>
 
-            <div className="tunnel-cfg-box">
-              <div className="tunnel-cfg-inputs">
-                <input
-                  type="text"
-                  value={relayUrl}
-                  onChange={(e) => setRelayUrl(e.target.value)}
-                  placeholder="中继地址，如 wss://relay.example.com/ws"
-                />
-                <input
-                  type="password"
-                  value={relaySecret}
-                  onChange={(e) => setRelaySecret(e.target.value)}
-                  placeholder="可选：RELAY_SECRET"
-                />
-              </div>
-              <div className="tunnel-cfg-actions">
-                <button
-                  type="button"
-                  className="btn-secondary btn-xs"
-                  onClick={async () => {
-                    await desktopApi.setRelayConfig({ relayUrl, relaySecret });
-                    flashMsg('中继配置已保存');
-                  }}
-                >
-                  保存并连接
-                </button>
-                <button
-                  type="button"
-                  className="btn-ghost btn-xs"
-                  onClick={async () => {
-                    setRelayUrl('');
-                    setRelaySecret('');
-                    await desktopApi.setRelayConfig({ relayUrl: '', relaySecret: '' });
-                  }}
-                >
-                  断开清除
-                </button>
-              </div>
+            <div className="svc-head">
+              <button
+                type="button"
+                className="btn-secondary btn-xs"
+                onClick={async () => {
+                  await desktopApi.setRelayConfig({ relayUrl, relaySecret });
+                  flashMsg('已保存');
+                }}
+              >
+                {hostStatus.relayConnected ? '重新连接' : '连接'}
+              </button>
             </div>
           </section>
         )}
@@ -805,7 +706,7 @@ export function HostSettingsPanel({ desktopApi, state }) {
               />
               <span>新连接需本机审批</span>
             </label>
-            <label className="toggle-chip" title="全部远程断开后自动更换新配对码">
+            <label className="toggle-chip" title="全部断开后自动更换新密码">
               <input
                 type="checkbox"
                 checked={Boolean(hostStatus.autoRotatePin)}

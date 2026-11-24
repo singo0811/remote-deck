@@ -19,9 +19,9 @@ import { HostAgent } from '../packages/host-agent/src/agent.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webDistDir = path.resolve(__dirname, '../apps/web/dist');
 
-function connectAndAuthWs(wsUrl, pin, expectBadPin = false) {
+function connectAndAuthWs(wsUrl, pin, expectBadPin = false, options) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl, options);
     ws.binaryType = 'arraybuffer';
     const timer = setTimeout(() => {
       ws.close();
@@ -54,6 +54,41 @@ function connectAndAuthWs(wsUrl, pin, expectBadPin = false) {
     });
   });
 }
+
+test('tunnel classifies the session and returns the native click result', async (t) => {
+  const agent = new HostAgent({ lanPort: 0, lanHost: '127.0.0.1', discoveryPort: 0, pin: 'TESTPIN8' });
+  t.after(() => agent.stop());
+  const { lanPort } = await agent.start();
+  const { ws, auth } = await connectAndAuthWs(`ws://127.0.0.1:${lanPort}/ws`, 'TESTPIN8', false, {
+    headers: { 'cf-ray': 'test-ray' },
+  });
+  t.after(() => ws.terminate());
+  assert.equal(auth.channel, 'tunnel');
+  assert.equal(auth.inputAcknowledgements, true);
+
+  const inject = t.mock.method(agent.native, 'injectMouse', async () => {});
+  const click = (inputId) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error('Missing click result'));
+    }, 2000);
+    const onMessage = (data, binary) => {
+      if (binary) return;
+      const msg = JSON.parse(data.toString());
+      if (msg.type !== 'input_result' || msg.inputId !== inputId) return;
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      resolve(msg);
+    };
+    ws.on('message', onMessage);
+    ws.send(JSON.stringify({ type: MSG.INPUT_MOUSE, action: 'click', x: 0.25, y: 0.5, inputId }));
+  });
+  assert.deepEqual(await click(1), { type: 'input_result', inputId: 1, ok: true });
+  assert.equal(inject.mock.calls[0].arguments[0].x, 0.25);
+  assert.equal(inject.mock.calls[0].arguments[1], true);
+  inject.mock.mockImplementation(async () => { throw new Error('SendInput failed'); });
+  assert.deepEqual(await click(2), { type: 'input_result', inputId: 2, ok: false, error: 'SendInput failed' });
+});
 
 test('E2E LAN direct: auth, real screen JPEG capture, PTY execution, and file CRUD/transfer', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'remotedeck-e2e-'));

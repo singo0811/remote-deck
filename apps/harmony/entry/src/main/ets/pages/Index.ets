@@ -394,13 +394,13 @@ struct Index {
         return;
       }
       this.startTsnetPolling();
-      this.showToast('正在初始化 P2P 组网...');
+      this.showToast('正在初始化组网...');
     } else {
       TsnetClient.stop();
       this.stopTsnetPolling();
       this.tsnetWasRunning = false;
       this.tsnetStatus = emptyTsnetStatus();
-      this.showToast('已关闭内嵌 P2P 组网');
+      this.showToast('已关闭组网');
     }
   }
 
@@ -633,6 +633,7 @@ struct Index {
       onFsDownloadReady: (fileName: string, bytes: Uint8Array) => {
         void this.saveDownloadedFile(fileName, bytes);
       },
+      onInputError: (message: string) => this.showToast(message),
       onFsError: (errMsg: string) => {
         this.fsLoading = false;
         this.showToast(`文件操作失败: ${errMsg}`);
@@ -770,11 +771,9 @@ struct Index {
       if (lanFound.length > 0 && !this.serverUrl.trim() && lanFound[0].lanEndpoints.length > 0) {
         this.mode = 'direct';
         this.serverUrl = lanFound[0].lanEndpoints[0].httpUrl || lanFound[0].lanEndpoints[0].wsUrl;
-        this.deviceId = lanFound[0].deviceId;
       } else if (nextList.length > 0 && !this.serverUrl.trim() && nextList[0].tunnelUrl) {
         this.mode = 'direct';
         this.serverUrl = nextList[0].tunnelUrl;
-        this.deviceId = nextList[0].deviceId;
       }
     } finally {
       this.scanningLan = false;
@@ -783,14 +782,12 @@ struct Index {
 
   private async refreshRelayDevices(): Promise<void> {
     if (!this.serverUrl.trim()) {
-      this.showToast('请先填写中继服务器或主机地址');
+      this.showToast('请先填写服务器或主机地址');
       return;
     }
     const list = await this.ensureClient().fetchDevices(this.serverUrl);
     this.onlineDevices = list;
-    if (list.length === 1 && !this.deviceId.trim()) {
-      this.deviceId = list[0].deviceId;
-    }
+
   }
 
   private looksLikeAddress(input: string): boolean {
@@ -832,7 +829,7 @@ struct Index {
     }
 
     if (!effPin) {
-      this.errorMsg = '请输入访问配对码 (PIN)';
+      this.errorMsg = '请输入密码';
       return;
     }
 
@@ -895,7 +892,7 @@ struct Index {
     }
 
     if (!effServer) {
-      this.errorMsg = '未发现该设备：若已离开电脑所在 Wi-Fi，请用「扫一扫直连」扫描电脑上的外网二维码，或填入外网/中继地址';
+      this.errorMsg = '未找到该设备，请扫码或检查网络';
       return;
     }
     if (effMode === 'relay' && !effDeviceId) {
@@ -1101,35 +1098,24 @@ struct Index {
   @Builder
   private buildConnectHeader() {
     Row({ space: 10 }) {
-      Column({ space: 2 }) {
-        Row({ space: 8 }) {
-          Text('RemoteDeck')
-            .fontSize(20)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#EEF2F9')
-          if (this.tsnetStatus.tailscaleIp.length > 0) {
-            Text('P2P已组网')
-              .fontSize(10)
-              .fontColor('#10B981')
-              .backgroundColor('#0E2A24')
-              .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-              .borderRadius(8)
-          }
-        }
-        Text('跨平台 P2P 组网 · 内外网自适应远控')
-          .fontSize(11)
-          .fontColor('#8A9BB8')
-      }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
+      Text('RemoteDeck')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#EEF2F9')
+        .fontFamily('HarmonyOS Sans')
+        .layoutWeight(1)
 
-      Button(`${this.effectiveTier().toUpperCase()} (${this.layoutOverride === 'auto' ? '自动' : '手动'})`)
-        .height(30)
-        .fontSize(11)
-        .backgroundColor('#162032')
-        .fontColor('#38BDF8')
-        .borderRadius(15)
-        .border({ width: 1, color: '#22314C' })
+      if (this.tsnetStatus.tailscaleIp.length > 0) {
+        Text('组网')
+          .fontSize(10)
+          .fontColor('#10B981')
+          .padding({ left: 2, right: 2 })
+      }
+
+      Text('我的')
+        .fontSize(12)
+        .fontColor('#8A9BB8')
+        .padding({ left: 8, right: 4 })
         .onClick(() => {
           this.cycleLayoutOverride();
         })
@@ -1255,9 +1241,9 @@ struct Index {
   }
 
   private formatChannelLabel(ch: string): string {
-    if (ch === 'tailscale') return 'P2P组网';
+    if (ch === 'tailscale') return '组网';
     if (ch === 'tunnel') return '外网隧道';
-    if (ch === 'relay') return '中继';
+    if (ch === 'relay') return '公网';
     return '局域网';
   }
 

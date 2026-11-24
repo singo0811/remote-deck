@@ -261,7 +261,7 @@ export class NativeBridge extends EventEmitter {
     return res.displays || [];
   }
 
-  captureFrame({ displayId = 0, scale = 0.75, quality = 70, lastHash = '', seq = 0, allowDirty = false, video = false, fps = 20, paceMs = 0, roiX = 0, roiY = 0, roiW = 0, roiH = 0 } = {}) {
+  captureFrame({ displayId = 0, scale = 0.75, maxWidth = 0, quality = 70, lastHash = '', seq = 0, allowDirty = false, singleFrame = false, separateCursor = false, cursorShapeId = 0, forceKey = false, video = false, fps = 20, paceMs = 0, roiX = 0, roiY = 0, roiW = 0, roiH = 0 } = {}) {
     this.start();
     const reqId = this.#nextReqId();
     return new Promise((resolve, reject) => {
@@ -272,7 +272,10 @@ export class NativeBridge extends EventEmitter {
       }, 5000);
       this.captureQueue.push({ reqId, resolve, reject, timer });
       try {
-        this.#sendJson(CMD.CAPTURE, { reqId, displayId, scale, quality, lastHash, seq, allowDirty, video, fps, paceMs, roiX, roiY, roiW, roiH });
+        this.#sendJson(CMD.CAPTURE, {
+          reqId, displayId, scale, maxWidth, quality, lastHash, seq, allowDirty,
+          singleFrame, separateCursor, cursorShapeId, forceKey, video, fps, paceMs, roiX, roiY, roiW, roiH,
+        });
       } catch (err) {
         clearTimeout(timer);
         const idx = this.captureQueue.findIndex((item) => item.reqId === reqId);
@@ -309,7 +312,8 @@ export class NativeBridge extends EventEmitter {
     return await this.#requestJson(CMD.SYS_INFO, {});
   }
 
-  injectMouse(req) {
+  injectMouse(req, acknowledge = false) {
+    if (acknowledge) return this.#requestJson(CMD.MOUSE, req, 2000);
     this.start();
     this.#sendJson(CMD.MOUSE, req);
   }

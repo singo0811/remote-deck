@@ -252,7 +252,7 @@ func startVideoEncoder(w, h, fps, quality int) error {
 	args = append(args, inputArgs...)
 	args = append(args, filterAndCodec...)
 	args = append(args, "-flush_packets", "1", "-f", "h264", "pipe:1")
-	return startFfmpegVideoCmd(args, false, w, h, fps)
+	return startFfmpegVideoCmd(args, false, w, h, fps, encoderTargetKbps(w, h, fps, quality))
 }
 
 func injectMousePlatform(req mouseReq, disp displayInfo, px, py int) error {

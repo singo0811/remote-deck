@@ -124,7 +124,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
         }
         setStatusText('');
       } else if (!directHost.trim()) {
-        setStatusText('未检测到 hdc 在线手机；可开启无线调试或直接填入手机 IP / Tailscale IP 免 USB 观看 60fps 画面');
+        setStatusText('未检测到手机');
       }
     } catch (err) {
       setStatusText(`查询手机列表失败: ${err?.message || err}`);
@@ -237,7 +237,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
     }
 
     if (transport) {
-      setStatusText('正在通过远程控制通道建立手机 H.264 60fps 投屏...');
+      setStatusText('正在连接...');
       void sendRemoteReq({
         type: MSG.PHONE_STREAM_START,
         serial: selectedSerial,
@@ -267,7 +267,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
-    setStatusText('正在建立 H.264 60fps 投屏通道（请确保手机端已点「开始共享」）...');
+    setStatusText('请在手机端点「开始共享」');
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
@@ -486,10 +486,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
     <div className="rd-section-stack">
       <div className="rd-toolbar-row">
         <div>
-          <h2>鸿蒙手机反向投屏与控制</h2>
-          <p className="muted">
-            {transport ? '正在通过当前远程会话跨网控制被控电脑连接的手机' : '支持免 USB 30~60fps H.264 硬编实时流（局域网 / Tailscale P2P）与手机内录声音'}
-          </p>
+          <h2>手机投屏</h2>
         </div>
         <div className="rd-phone-actions">
           {phones.length > 0 && (
@@ -500,7 +497,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
             >
               {phones.map((p) => (
                 <option key={p.serial} value={p.serial}>
-                  {p.name} ({p.serial})
+                  {p.name}
                 </option>
               ))}
             </select>
@@ -510,8 +507,8 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
             value={streamMode}
             onChange={(e) => setStreamMode(e.target.value)}
           >
-            {h264Supported && <option value="h264">H.264 60fps（免USB推荐）</option>}
-            <option value="snapshot">HDC 截图（兜底）</option>
+            {h264Supported && <option value="h264">高清</option>}
+            <option value="snapshot">截图</option>
           </select>
           {streamMode === 'h264' && (
             <button
@@ -519,11 +516,11 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
               className={`btn-secondary btn-sm ${phoneAudioEnabled ? 'btn-active-pill' : ''}`}
               onClick={handleTogglePhoneAudio}
             >
-              {phoneAudioEnabled ? '手机声音开' : '手机声音'}
+              声音
             </button>
           )}
           <button type="button" className="btn-secondary btn-sm" onClick={refreshDevices} disabled={loadingList}>
-            {loadingList ? '扫描中...' : '刷新设备'}
+            {loadingList ? '扫描中...' : '刷新'}
           </button>
           <button
             type="button"
@@ -531,36 +528,39 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
             onClick={() => setStreaming((v) => !v)}
             disabled={!hasTarget}
           >
-            {streaming ? '暂停画面' : '恢复画面'}
+            {streaming ? '暂停' : '恢复'}
           </button>
         </div>
       </div>
 
-      <div className="rd-phone-connect-bar">
-        <label className="rd-inline-field">
-          <span>免 USB 直连 IP（手机局域网 / Tailscale IP）</span>
-          <input
-            type="text"
-            value={directHost}
-            onChange={(e) => setDirectHost(e.target.value)}
-            placeholder="例如 192.168.3.2 或 100.x.y.z（默认端口 9603）"
-          />
-        </label>
-        <form className="rd-inline-field" onSubmit={handleConnectWireless}>
-          <span>无线调试控制（可选，hdc tconn）</span>
-          <div className="rd-inline-input-btn">
+      <details className="rd-phone-advanced">
+        <summary>高级</summary>
+        <div className="rd-phone-connect-bar">
+          <label className="rd-inline-field">
+            <span>手机地址</span>
             <input
               type="text"
-              value={wirelessTarget}
-              onChange={(e) => setWirelessTarget(e.target.value)}
-              placeholder="ip:无线调试端口，如 192.168.3.2:36903"
+              value={directHost}
+              onChange={(e) => setDirectHost(e.target.value)}
+              placeholder="自动或手动填写"
             />
-            <button type="submit" className="btn-secondary btn-sm" disabled={connectingWireless || !wirelessTarget.trim()}>
-              {connectingWireless ? '连接中...' : '无线连接'}
-            </button>
-          </div>
-        </form>
-      </div>
+          </label>
+          <form className="rd-inline-field" onSubmit={handleConnectWireless}>
+            <span>无线调试</span>
+            <div className="rd-inline-input-btn">
+              <input
+                type="text"
+                value={wirelessTarget}
+                onChange={(e) => setWirelessTarget(e.target.value)}
+                placeholder="地址:端口"
+              />
+              <button type="submit" className="btn-secondary btn-sm" disabled={connectingWireless || !wirelessTarget.trim()}>
+                {connectingWireless ? '连接中...' : '连接'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </details>
 
       {statusText && <div className="alert-info">{statusText}</div>}
 
@@ -597,8 +597,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
             />
           ) : (
             <div className="rd-empty-panel">
-              <strong>{selectedSerial ? '正在拉取手机实时画面...' : '暂无可控制的在线手机'}</strong>
-              <p className="muted">手机开启开发者模式「无线调试」或 USB 连接本机后点「刷新设备」。</p>
+              <strong>{selectedSerial ? '正在连接...' : '没有设备'}</strong>
             </div>
           )}
         </div>
@@ -675,11 +674,7 @@ export function PhoneMirrorPane({ transport = null, phoneHubRef = null }) {
             </button>
           </form>
 
-          <p className="muted" style={{ fontSize: '12px', marginTop: '8px' }}>
-            触控映射：{phoneDims.width} × {phoneDims.height}
-            {streamMode === 'h264' && videoDims.width > 0 ? ` · 视频流 ${videoDims.width} × ${videoDims.height}` : ''}
-            {sending ? ' · 执行中...' : ''}
-          </p>
+          {sending ? <p className="muted" style={{ fontSize: '12px', marginTop: '8px' }}>执行中...</p> : null}
         </aside>
       </div>
     </div>

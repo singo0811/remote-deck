@@ -1,5 +1,6 @@
 import { Want, common } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
+import { preferences } from '@kit.ArkData';
 import { scanBarcode } from '@kit.ScanKit';
 import {
   PhoneShareStatus,
@@ -9,6 +10,19 @@ import {
   parseConnectUrl,
 } from '../protocol/Protocol';
 import { TsnetPeer, TsnetStatus, emptyTsnetStatus } from '../protocol/TsnetClient';
+import { AccountPane } from './AccountPane';
+import { http } from '@kit.NetworkKit';
+
+interface AcctDevice {
+  deviceId?: string;
+  name?: string;
+  online?: boolean;
+}
+
+interface AcctListResult {
+  ok?: boolean;
+  devices?: AcctDevice[];
+}
 
 @Component
 export struct ConnectPane {
@@ -19,6 +33,11 @@ export struct ConnectPane {
   @Prop onlineDevices: RemoteDeviceInfo[] = [];
   @Prop recentDevices: RecentDeviceItem[] = [];
   @Prop scanningLan: boolean = false;
+  @State myCode: string = '';
+  @State myPin: string = '';
+  @State pinDraft: string = '';
+  @State editingPin: boolean = false;
+  @State acctDevices: AcctDevice[] = [];
   @Prop tsnetStatus: TsnetStatus = emptyTsnetStatus();
   @Prop phoneShareStatus: PhoneShareStatus = emptyPhoneShareStatus();
 
@@ -47,10 +66,177 @@ export struct ConnectPane {
     const hasLan = dev.lanEndpoints.some((ep) => ep.kind === 'lan');
     const hasMesh = dev.lanEndpoints.some((ep) => ep.kind === 'tailscale');
     if (hasLan) tags.push('局域网');
-    if (hasMesh) tags.push('P2P组网');
+    if (hasMesh) tags.push('组网');
     if (dev.tunnelUrl && dev.tunnelUrl.length > 0) tags.push('外网可用');
     return tags.length > 0 ? tags.join(' · ') : '在线';
   }
+
+  private async loadIdentity(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const store = await preferences.getPreferences(ctx, 'remotedeck_account');
+      const code = (await store.get('phone_device_id', '')) as string;
+      let pin = (await store.get('phone_pin', '')) as string;
+      if (pin.length === 0) {
+        pin = '';
+        const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        for (let i = 0; i < 8; i++) pin += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
+        await store.put('phone_pin', pin);
+        await store.flush();
+      }
+      this.myCode = code.length > 0 ? code : '未登录';
+      this.myPin = pin;
+      this.pinDraft = pin;
+    } catch {
+      this.myCode = this.myCode.length > 0 ? this.myCode : '未登录';
+    }
+  }
+
+  private async savePin(): Promise<void> {
+    const next = this.pinDraft.trim().toUpperCase();
+    if (next.length < 6) {
+      this.onToast('验证码至少 6 位');
+      return;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const store = await preferences.getPreferences(ctx, 'remotedeck_account');
+      await store.put('phone_pin', next);
+      await store.flush();
+      this.myPin = next;
+      this.editingPin = false;
+      this.onToast('验证码已更新');
+    } catch {
+      this.onToast('保存失败');
+    }
+  }
+
+  aboutToAppear(): void {
+    void this.loadIdentity();
+    void this.loadAccountDevices();
+  }
+
+  private async loadAccountDevices(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const store = await preferences.getPreferences(ctx, 'remotedeck_account');
+      const token = (await store.get('token', '')) as string;
+      if (token.length === 0) {
+        this.acctDevices = [];
+        return;
+      }
+      const req = http.createHttp();
+      try {
+        const res = await req.request('https://miaosizhineng.online/api/auth/devices', {
+          method: http.RequestMethod.GET,
+          header: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          connectTimeout: 10000,
+          readTimeout: 10000,
+        });
+        const text = typeof res.result === 'string' ? res.result : '';
+        const parsed = JSON.parse(text) as AcctListResult;
+        if (parsed.ok === true) this.acctDevices = parsed.devices ?? [];
+      } finally {
+        req.destroy();
+      }
+    } catch {
+      // Keep whatever list we had.
+    }
+  }
+
+  @Builder
+  private buildSelfCard() {
+    Column({ space: 14 }) {
+      Row({ space: 8 }) {
+        Text('本机')
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#EEF2F9')
+          .fontFamily('HarmonyOS Sans')
+          .layoutWeight(1)
+        Text('复制代码')
+          .fontSize(12)
+          .fontColor('#38BDF8')
+          .onClick(() => {
+            const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.myCode);
+            pasteboard.getSystemPasteboard().setData(data).then(() => this.onToast('已复制'));
+          })
+      }
+      .width('100%')
+
+      Column({ space: 6 }) {
+        Text('设备代码')
+          .fontSize(12)
+          .fontColor('#8A9BB8')
+        Text(this.myCode)
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#EEF2F9')
+          .fontFamily('HarmonyOS Sans')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+
+      Column({ space: 6 }) {
+        Row({ space: 6 }) {
+          Text('验证码')
+            .fontSize(12)
+            .fontColor('#8A9BB8')
+            .layoutWeight(1)
+          if (!this.editingPin) {
+            Text('自定义')
+              .fontSize(12)
+              .fontColor('#38BDF8')
+              .onClick(() => {
+                this.pinDraft = this.myPin;
+                this.editingPin = true;
+              })
+          }
+        }
+        .width('100%')
+
+        if (this.editingPin) {
+          Row({ space: 8 }) {
+            TextInput({ text: this.pinDraft, placeholder: '6-12 位' })
+              .height(42)
+              .layoutWeight(1)
+              .fontSize(16)
+              .fontColor('#EEF2F9')
+              .placeholderColor('#566B88')
+              .backgroundColor('#080C14')
+              .borderRadius(10)
+              .border({ width: 1, color: '#22314C' })
+              .padding({ left: 14, right: 14 })
+              .onChange((v: string) => { this.pinDraft = v.toUpperCase(); })
+            Button('保存')
+              .height(42)
+              .width(72)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor('#2563EB')
+              .borderRadius(10)
+              .onClick(() => { void this.savePin(); })
+          }
+          .width('100%')
+        } else {
+          Text(this.myPin)
+            .fontSize(22)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#EEF2F9')
+            .fontFamily('HarmonyOS Sans')
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+    }
+    .width('100%')
+    .padding(18)
+    .backgroundColor('#0F1623')
+    .borderRadius(16)
+    .border({ width: 1, color: '#22314C' })
+    .alignItems(HorizontalAlign.Start)
+  }
+
 
   private openExternalUrl(url: string): void {
     try {
@@ -101,6 +287,25 @@ export struct ConnectPane {
       }
     }
     return false;
+  }
+
+  private connectAccountDevice(id: string): void {
+    const match = this.onlineDevices.find((d) => d.deviceId === id);
+    if (match) {
+      this.quickRemoteDevice(match);
+      return;
+    }
+    this.deviceId = id;
+    this.promptDevice = {
+      deviceId: id,
+      deviceName: id,
+      platform: '',
+      online: true,
+      displays: [],
+      lanEndpoints: [],
+      tunnelUrl: '',
+    };
+    this.promptPin = this.findSavedPin(id);
   }
 
   private quickRemoteDevice(dev: RemoteDeviceInfo): void {
@@ -180,7 +385,7 @@ export struct ConnectPane {
         this.onSubmitConnect();
         return;
       }
-      this.onToast(`已识别 ${parsed.mode === 'direct' ? '直连地址' : '中继设备'}，请输入配对码`);
+      this.onToast('已识别设备，请输入密码');
     } catch {
       this.onToast('已取消扫码或当前设备不支持相机扫码');
     }
@@ -200,19 +405,19 @@ export struct ConnectPane {
                     ? '#F59E0B'
                     : '#64748B'
               )
-            Text('内嵌 Tailscale P2P 组网')
+            Text('组网')
               .fontSize(15)
               .fontWeight(FontWeight.Bold)
               .fontColor('#EEF2F9')
           }
           Text(
             this.tsnetStatus.tailscaleIp.length > 0
-              ? `已组网: ${this.tsnetStatus.tailscaleIp} · 在线节点 ${this.tsnetStatus.peers.filter((p) => p.online).length}`
+              ? `已组网 · 在线节点 ${this.tsnetStatus.peers.filter((p) => p.online).length}`
               : this.tsnetStatus.authUrl.length > 0
                 ? '等待在浏览器登录授权同账号'
                 : this.tsnetStatus.enabled
                   ? `状态: ${this.tsnetStatus.state || '启动中...'}`
-                  : '无需单独装软件，开启后手机与电脑跨网 P2P 打洞直连'
+                  : '无需额外软件'
           )
             .fontSize(12)
             .fontColor('#8A9BB8')
@@ -319,13 +524,13 @@ export struct ConnectPane {
               Row({ space: 8 }) {
                 Circle({ width: 7, height: 7 })
                   .fill(peer.online ? '#10B981' : '#64748B')
-                Text(`${peer.name} (${peer.ip})`)
+                Text(peer.name)
                   .fontSize(12)
                   .fontColor('#CBD5E1')
                   .layoutWeight(1)
-                Text(peer.curAddr.length > 0 ? 'P2P直连' : peer.relay.length > 0 ? `DERP:${peer.relay}` : (peer.online ? '在线' : '离线'))
+                Text(peer.online ? '在线' : '离线')
                   .fontSize(11)
-                  .fontColor(peer.curAddr.length > 0 ? '#10B981' : '#8A9BB8')
+                  .fontColor(peer.online ? '#10B981' : '#8A9BB8')
               }
               .width('100%')
               .padding({ top: 6, bottom: 6, left: 8, right: 8 })
@@ -375,7 +580,7 @@ export struct ConnectPane {
       Row({ space: 10 }) {
         Column({ space: 2 }) {
           Row({ space: 6 }) {
-            Text('手机投屏共享 (H.264 被控)')
+            Text('手机投屏')
               .fontSize(15)
               .fontWeight(FontWeight.Bold)
               .fontColor('#EEF2F9')
@@ -388,9 +593,6 @@ export struct ConnectPane {
                 .borderRadius(6)
             }
           }
-          Text('电脑端 RemoteDeck「手机镜像」可直接 30~60fps 流畅观看')
-            .fontSize(11)
-            .fontColor('#8A9BB8')
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
@@ -412,7 +614,7 @@ export struct ConnectPane {
         Text(
           `端口 ${this.phoneShareStatus.port} · ${this.phoneShareStatus.width}x${this.phoneShareStatus.height}` +
           ` · 已编码 ${this.phoneShareStatus.frames} 帧 · 已连接电脑 ${this.phoneShareStatus.clients} 台` +
-          (this.tsnetStatus.tailscaleIp.length > 0 ? ` · P2P IP: ${this.tsnetStatus.tailscaleIp}` : '')
+          (this.tsnetStatus.tailscaleIp.length > 0 ? ' · 已组网' : '')
         )
           .fontSize(11)
           .fontColor('#CBD5E1')
@@ -437,19 +639,14 @@ export struct ConnectPane {
   private buildFormCard() {
     Column({ space: 14 }) {
       Row({ space: 8 }) {
-        Column({ space: 2 }) {
-          Text('控制远程设备')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#EEF2F9')
-          Text('输入设备代码或粘贴电脑端分享口令')
-            .fontSize(12)
-            .fontColor('#8A9BB8')
-        }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
+        Text('连接')
+          .fontSize(16)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#EEF2F9')
+          .fontFamily('HarmonyOS Sans')
+          .layoutWeight(1)
 
-        Button('扫一扫')
+        Button('扫码')
           .height(32)
           .padding({ left: 12, right: 12 })
           .fontSize(12)
@@ -465,12 +662,12 @@ export struct ConnectPane {
       .width('100%')
 
       Column({ space: 6 }) {
-        Text('远程设备识别码')
+        Text('对方设备代码')
           .fontSize(12)
           .fontColor('#8A9BB8')
         TextInput({
           text: this.deviceId,
-          placeholder: '例如 RD-4829-7310 或连接口令 URL',
+          placeholder: 'RD-0000-0000',
         })
           .height(44)
           .fontSize(15)
@@ -490,7 +687,7 @@ export struct ConnectPane {
                 if (parsed.pin.length > 0) {
                   this.pin = parsed.pin;
                 }
-                this.onToast('已自动识别远程口令中的地址与配对码');
+                this.onToast('已识别口令');
                 return;
               }
               this.deviceId = trimmed;
@@ -503,12 +700,12 @@ export struct ConnectPane {
       .alignItems(HorizontalAlign.Start)
 
       Column({ space: 6 }) {
-        Text('临时访问密码 (PIN)')
+        Text('密码')
           .fontSize(12)
           .fontColor('#8A9BB8')
         TextInput({
           text: this.pin,
-          placeholder: '输入被控端显示的 8 位临时密码',
+          placeholder: '8 位密码',
         })
           .type(InputType.Password)
           .showPasswordIcon(false)
@@ -526,69 +723,6 @@ export struct ConnectPane {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
 
-      Row({ space: 8 }) {
-        Text(this.showAdvancedServer ? '收起外网 / 中继网关设置 ▲' : '指定外网隧道 / 中继服务器（可选） ▾')
-          .fontSize(12)
-          .fontColor('#38BDF8')
-          .onClick(() => {
-            this.showAdvancedServer = !this.showAdvancedServer;
-          })
-      }
-      .width('100%')
-
-      if (this.showAdvancedServer) {
-        Column({ space: 8 }) {
-          Row({ space: 8 }) {
-            Button('直连 / 外网隧道')
-              .height(32)
-              .fontSize(12)
-              .layoutWeight(1)
-              .backgroundColor(this.mode === 'direct' ? '#173054' : '#080C14')
-              .fontColor(this.mode === 'direct' ? '#38BDF8' : '#8A9BB8')
-              .borderRadius(8)
-              .border({ width: 1, color: this.mode === 'direct' ? '#38BDF8' : '#22314C' })
-              .onClick(() => {
-                this.mode = 'direct';
-              })
-
-            Button('中继服务器')
-              .height(32)
-              .fontSize(12)
-              .layoutWeight(1)
-              .backgroundColor(this.mode === 'relay' ? '#173054' : '#080C14')
-              .fontColor(this.mode === 'relay' ? '#38BDF8' : '#8A9BB8')
-              .borderRadius(8)
-              .border({ width: 1, color: this.mode === 'relay' ? '#38BDF8' : '#22314C' })
-              .onClick(() => {
-                this.mode = 'relay';
-              })
-          }
-          .width('100%')
-
-          TextInput({
-            text: this.serverUrl,
-            placeholder: this.mode === 'relay'
-              ? '输入中继地址，如 https://relay.example.com'
-              : '输入主机 IP 或外网隧道域名，如 https://xxx.trycloudflare.com',
-          })
-            .height(40)
-            .fontSize(13)
-            .fontColor('#EEF2F9')
-            .placeholderColor('#64748B')
-            .backgroundColor('#080C14')
-            .borderRadius(8)
-            .border({ width: 1, color: '#22314C' })
-            .onChange((val: string) => {
-              this.serverUrl = val.trim();
-            })
-        }
-        .width('100%')
-        .padding(10)
-        .backgroundColor('#080C14')
-        .borderRadius(10)
-        .border({ width: 1, color: '#22314C' })
-      }
-
       if (this.errorMsg.length > 0) {
         Text(this.errorMsg)
           .width('100%')
@@ -599,7 +733,7 @@ export struct ConnectPane {
           .padding(10)
       }
 
-      Button(this.connecting ? '正在建立安全连接...' : '连接远程桌面')
+      Button(this.connecting ? '连接中...' : '连接')
         .width('100%')
         .height(46)
         .fontSize(15)
@@ -655,7 +789,7 @@ export struct ConnectPane {
                   .fontSize(14)
                   .fontWeight(FontWeight.Medium)
                   .fontColor('#EEF2F9')
-                Text(`${item.deviceId} · ${item.mode === 'relay' ? '中继' : '直连'}`)
+                Text(item.deviceId)
                   .fontSize(11)
                   .fontColor('#8A9BB8')
               }
@@ -698,51 +832,34 @@ export struct ConnectPane {
     Column({ space: 12 }) {
       Row({ space: 8 }) {
         Column({ space: 2 }) {
-          Text(`在线设备 (${this.onlineDevices.length})`)
+          Text('设备')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .fontColor('#EEF2F9')
-          Text('同局域网、P2P 组网与中继设备')
-            .fontSize(11)
-            .fontColor('#8A9BB8')
+            .fontFamily('HarmonyOS Sans')
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
 
-        Button(this.scanningLan ? '扫描中...' : '扫描')
-          .height(32)
-          .fontSize(12)
-          .backgroundColor('#162032')
-          .fontColor('#10B981')
-          .borderRadius(8)
-          .border({ width: 1, color: '#22314C' })
-          .enabled(!this.scanningLan)
-          .onClick(() => {
-            this.onScanLan();
-          })
-
-        Button('刷新中继')
+        Button(this.scanningLan ? '扫描中...' : '刷新')
           .height(32)
           .fontSize(12)
           .backgroundColor('#162032')
           .fontColor('#EEF2F9')
           .borderRadius(8)
           .border({ width: 1, color: '#22314C' })
+          .enabled(!this.scanningLan)
           .onClick(() => {
-            this.onRefreshRelay();
+            this.onScanLan();
           })
       }
       .width('100%')
 
       if (this.onlineDevices.length === 0) {
         Column({ space: 6 }) {
-          Text(this.scanningLan ? '正在扫描局域网与组网节点...' : '暂未发现当前网络下的在线电脑')
+          Text(this.scanningLan ? '扫描中...' : '没有设备')
             .fontSize(13)
             .fontColor('#8A9BB8')
-          Text('可切回「远程」页扫一扫电脑二维码，或输入设备 ID / IP 连接。')
-            .fontSize(12)
-            .fontColor('#64748B')
-            .textAlign(TextAlign.Center)
         }
         .width('100%')
         .padding(18)
@@ -751,7 +868,52 @@ export struct ConnectPane {
         .border({ width: 1, color: '#22314C' })
       } else {
         Column({ space: 8 }) {
-          ForEach(this.onlineDevices, (dev: RemoteDeviceInfo) => {
+          if (this.acctDevices.length > 0) {
+            Text('我的设备')
+              .fontSize(12)
+              .fontColor('#8A9BB8')
+              .width('100%')
+            ForEach(this.acctDevices, (dev: AcctDevice) => {
+              Row({ space: 10 }) {
+                Circle({ width: 8, height: 8 })
+                  .fill(dev.online === true ? '#10B981' : '#64748B')
+                Column({ space: 3 }) {
+                  Text(dev.name ?? dev.deviceId ?? '')
+                    .fontSize(14)
+                    .fontColor('#EEF2F9')
+                  Text(`${dev.deviceId ?? ''} · ${dev.online === true ? '在线' : '离线'}`)
+                    .fontSize(11)
+                    .fontColor('#8A9BB8')
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+
+                if (dev.deviceId === this.myCode) {
+                  Text('本机')
+                    .fontSize(12)
+                    .fontColor('#38BDF8')
+                    .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                    .backgroundColor('#162032')
+                    .borderRadius(9)
+                } else {
+                  Button('连接')
+                    .height(32)
+                    .fontSize(12)
+                    .fontColor('#FFFFFF')
+                    .backgroundColor(dev.online === true ? '#2563EB' : '#162032')
+                    .borderRadius(9)
+                    .enabled(dev.online === true)
+                    .onClick(() => { this.connectAccountDevice(dev.deviceId ?? ''); })
+                }
+              }
+              .width('100%')
+              .padding(12)
+              .backgroundColor('#080C14')
+              .borderRadius(10)
+              .border({ width: 1, color: '#1B2740' })
+            }, (dev: AcctDevice) => dev.deviceId ?? '')
+          }
+          ForEach(this.onlineDevices.filter((d) => !this.acctDevices.some((a) => a.deviceId === d.deviceId)), (dev: RemoteDeviceInfo) => {
             Row({ space: 10 }) {
               Column({ space: 4 }) {
                 Row({ space: 6 }) {
@@ -761,21 +923,15 @@ export struct ConnectPane {
                     .fontSize(15)
                     .fontWeight(FontWeight.Medium)
                     .fontColor('#EEF2F9')
-                  Text(dev.platform.toUpperCase())
-                    .fontSize(10)
-                    .fontColor('#38BDF8')
-                    .backgroundColor('#162032')
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .borderRadius(5)
                 }
-                Text(`${dev.deviceId} · ${this.formatDeviceChannelHints(dev)}`)
+                Text(dev.deviceId)
                   .fontSize(12)
                   .fontColor('#8A9BB8')
               }
               .layoutWeight(1)
               .alignItems(HorizontalAlign.Start)
 
-              Button('直接远程')
+              Button('连接')
                 .height(34)
                 .fontSize(12)
                 .fontWeight(FontWeight.Medium)
@@ -817,6 +973,7 @@ export struct ConnectPane {
             if (this.tier === 'desktop' || this.tier === 'tablet') {
               Row({ space: 16 }) {
                 Column({ space: 14 }) {
+                  this.buildSelfCard()
                   this.buildFormCard()
                   this.buildTsnetCard()
                   this.buildPhoneShareCard()
@@ -833,12 +990,15 @@ export struct ConnectPane {
               .alignItems(VerticalAlign.Top)
             } else {
               if (this.phoneSubTab === 'connect') {
+                this.buildSelfCard()
                 this.buildFormCard()
                 this.buildRecentCard()
               } else if (this.phoneSubTab === 'devices') {
                 this.buildDevicesCard()
                 this.buildPhoneShareCard()
                 this.buildRecentCard()
+              } else if (this.phoneSubTab === 'account') {
+                AccountPane({ onConnectDevice: (id: string) => { this.connectAccountDevice(id); } })
               } else {
                 this.buildTsnetCard()
                 this.buildPhoneShareCard()
@@ -855,7 +1015,7 @@ export struct ConnectPane {
 
         if (this.tier === 'phone') {
           Row({ space: 6 }) {
-            Button('远程控制')
+            Button('连接')
               .layoutWeight(1)
               .height(40)
               .fontSize(13)
@@ -867,7 +1027,7 @@ export struct ConnectPane {
                 this.phoneSubTab = 'connect';
               })
 
-            Button(`设备列表 (${this.onlineDevices.length})`)
+            Button('设备')
               .layoutWeight(1)
               .height(40)
               .fontSize(13)
@@ -879,7 +1039,7 @@ export struct ConnectPane {
                 this.phoneSubTab = 'devices';
               })
 
-            Button(this.tsnetStatus.tailscaleIp.length > 0 ? 'P2P组网 ✓' : 'P2P 组网')
+            Button('组网')
               .layoutWeight(1)
               .height(40)
               .fontSize(13)
@@ -894,6 +1054,18 @@ export struct ConnectPane {
               .onClick(() => {
                 this.phoneSubTab = 'mesh';
                 this.showTsnetCard = true;
+              })
+
+            Button('我的')
+              .layoutWeight(1)
+              .height(40)
+              .fontSize(13)
+              .fontWeight(this.phoneSubTab === 'account' ? FontWeight.Bold : FontWeight.Normal)
+              .backgroundColor(this.phoneSubTab === 'account' ? '#173054' : 'transparent')
+              .fontColor(this.phoneSubTab === 'account' ? '#38BDF8' : '#8A9BB8')
+              .borderRadius(10)
+              .onClick(() => {
+                this.phoneSubTab = 'account';
               })
           }
           .width('100%')
@@ -918,7 +1090,7 @@ export struct ConnectPane {
 
             TextInput({
               text: this.promptPin,
-              placeholder: '输入 8 位配对码 (连接一次后将自动记住)',
+              placeholder: '8 位密码',
             })
               .height(44)
               .fontSize(15)
@@ -958,7 +1130,7 @@ export struct ConnectPane {
                 .onClick(() => {
                   const p = this.promptPin.trim();
                   if (!p) {
-                    this.onToast('请输入访问配对码');
+                    this.onToast('请输入密码');
                     return;
                   }
                   this.pin = p;

@@ -75,7 +75,7 @@ function DeskHubTile({
 
   const connectPreview = async () => {
     if (!item.pin) {
-      setErrMsg('请先进入连接一次以记住配对码');
+      setErrMsg('请先连接一次以记住密码');
       setStatus('error');
       return;
     }
@@ -180,7 +180,7 @@ function DeskHubTile({
           <span className="mini-tag">{groupName}</span>
           {status === 'connected' && (
             <span className="mini-tag tag-ok">
-              {channel === 'tailscale' ? '组网' : channel === 'tunnel' ? '隧道' : channel === 'relay' ? '中继' : '直连'}
+              {channel === 'tailscale' ? '组网' : channel === 'lan' ? '局域网' : '公网'}
               {rttMs != null ? ` ${rttMs}ms` : ''}
             </span>
           )}
@@ -468,7 +468,7 @@ export function DeskHubView({ devices, recent, onPickDevice, onPickRecent }) {
       {filteredItems.length === 0 ? (
         <div className="card empty-box">
           <p>桌面墙暂无可展示的设备</p>
-          <small>请先在「连接工作台」扫描局域网/组网设备或成功连接过至少一台设备。</small>
+          <small>先连接过至少一台设备。</small>
         </div>
       ) : (
         <div className="deskhub-grid">

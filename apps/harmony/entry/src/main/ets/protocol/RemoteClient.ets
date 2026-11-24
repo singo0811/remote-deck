@@ -63,6 +63,7 @@ import { decodeImaAdpcmToPcmBytes } from './AudioPlayer';
 
 export interface ClientCallbacks {
   onLog: (line: string) => void;
+  onInputError?: (message: string) => void;
   onStatus: (status: string, detail: string) => void;
   onAuthenticated: (auth: AuthOkInfo) => void;
   onTelemetry: (stats: TelemetryInfo) => void;
@@ -234,6 +235,9 @@ export class RemoteClient {
   private activeWs: webSocket.WebSocket | null = null;
   private signalingWs: webSocket.WebSocket | null = null;
   private channelKind: string = '';
+  private inputAcknowledgements: boolean = false;
+  private clickSequence: number = 0;
+  private clickTimer: number = 0;
   private closed: boolean = false;
   private wasAuthenticated: boolean = false;
   private reconnectAttempt: number = 0;
@@ -288,8 +292,8 @@ export class RemoteClient {
 
   private presetMaxWidth(preset: QualityPreset): number {
     if (preset.key === 'eco') return 1280;
-    if (preset.key === 'auto' || preset.key === 'balanced') return 1440;
-    if (preset.key === 'hd') return 1600;
+    if (preset.key === 'balanced') return 1440;
+    if (preset.key === 'auto' || preset.key === 'hd') return 1920;
     return 0;
   }
   private lastResyncAt: number = 0;
@@ -687,7 +691,7 @@ export class RemoteClient {
       return;
     }
 
-    this.callbacks.onLog(`连接中继/信令: ${wsUrl}`);
+    this.callbacks.onLog(`连接服务器: ${wsUrl}`);
     this.callbacks.onStatus('connecting', '正在查找设备并探测最优链路...');
     await this.connectViaRelay(wsUrl, deviceId, pin);
   }
@@ -771,6 +775,7 @@ export class RemoteClient {
             channel: effectiveKind,
             displays: parseDisplays(jsonArr(msg, 'displays')),
             permissions: parsePermissions(jsonAsObject(msg['permissions'])),
+            inputAcknowledgements: jsonBool(msg, 'inputAcknowledgements', false),
             lanEndpoints: parseLanEndpoints(jsonArr(msg, 'lanEndpoints')),
             tunnelUrl: jsonStr(msg, 'tunnelUrl'),
           };
@@ -879,12 +884,12 @@ export class RemoteClient {
       });
 
       ws.on('error', (err: BusinessError) => {
-        fail(new Error(err?.message || `无法连接中继服务器 ${relayWsUrl}`));
+        fail(new Error(err?.message || `无法连接服务器 ${relayWsUrl}`));
       });
 
       ws.on('close', () => {
         if (!settled) {
-          fail(new Error('中继连接已关闭'));
+          fail(new Error('连接已关闭'));
         }
         if (this.activeWs === ws && !this.closed) {
           this.handleUnexpectedDrop('连接已断开');
@@ -930,7 +935,7 @@ export class RemoteClient {
         }
 
         if (msgType === MsgType.RELAY_READY) {
-          this.callbacks.onLog('中继隧道就绪，正在鉴权...');
+          this.callbacks.onLog('服务器就绪，正在鉴权...');
           return;
         }
 
@@ -957,6 +962,7 @@ export class RemoteClient {
             channel: 'relay',
             displays: parseDisplays(jsonArr(msg, 'displays')),
             permissions: parsePermissions(jsonAsObject(msg['permissions'])),
+            inputAcknowledgements: jsonBool(msg, 'inputAcknowledgements', false),
             lanEndpoints: parseLanEndpoints(jsonArr(msg, 'lanEndpoints')),
             tunnelUrl: jsonStr(msg, 'tunnelUrl'),
           };
@@ -983,7 +989,7 @@ export class RemoteClient {
 
       ws.connect(relayWsUrl, (err: BusinessError, ok: boolean) => {
         if (err || !ok) {
-          fail(new Error(err?.message || `无法连接中继 ${relayWsUrl}`));
+          fail(new Error(err?.message || `无法连接服务器 ${relayWsUrl}`));
         }
       });
     });
@@ -992,6 +998,8 @@ export class RemoteClient {
   private activateWs(ws: webSocket.WebSocket, kind: string, info: AuthOkInfo): void {
     this.activeWs = ws;
     this.channelKind = kind;
+    this.inputAcknowledgements = info.inputAcknowledgements === true;
+    clearTimeout(this.clickTimer);
     this.wasAuthenticated = true;
     this.reconnectAttempt = 0;
     if (this.reconnectTimer >= 0) {
@@ -1149,7 +1157,9 @@ export class RemoteClient {
     this.lastCursorX = -1;
     this.lastCursorY = -1;
     this.videoModeActive = false;
-    this.codecMode = 'h264';
+    // A Cloudflare WebSocket is TCP and has head-of-line blocking. JPEG keeps
+    // every frame independently decodable until the native RTP path is used.
+    this.codecMode = this.channelKind === 'tunnel' || this.channelKind === 'relay' ? 'jpeg' : 'h264';
     const msg: OutMsgScreen = {
       type: MsgType.SCREEN_START,
       displayId,
@@ -1227,7 +1237,26 @@ export class RemoteClient {
       button,
       delta,
     };
-    this.sendJson(msg);
+    if (action !== 'click') {
+      this.sendJson(msg);
+      return;
+    }
+    const ws = this.activeWs;
+    if (!ws) return;
+    clearTimeout(this.clickTimer);
+    if (this.inputAcknowledgements) msg.inputId = ++this.clickSequence;
+    ws.send(JSON.stringify(msg)).catch(() => {
+      if (this.activeWs !== ws) return;
+      if (msg.inputId === undefined || msg.inputId === this.clickSequence) {
+        clearTimeout(this.clickTimer);
+        this.callbacks.onInputError?.('点击发送失败，请检查连接');
+      }
+    });
+    if (this.inputAcknowledgements) {
+      this.clickTimer = setTimeout(() => {
+        if (this.activeWs === ws) this.callbacks.onInputError?.('电脑未在 3 秒内确认点击');
+      }, 3000);
+    }
   }
 
   sendMouseWheel(delta: number): void {
@@ -1404,6 +1433,17 @@ export class RemoteClient {
         this.rttMs = Math.max(1, Date.now() - ts);
       } else if (this.lastPingSentMs > 0) {
         this.rttMs = Math.max(1, Date.now() - this.lastPingSentMs);
+      }
+      return;
+    }
+
+    if (t === 'input_result') {
+      if (jsonNum(msg, 'inputId', -1) === this.clickSequence) {
+        clearTimeout(this.clickTimer);
+        if (!jsonBool(msg, 'ok', false)) {
+          const error = jsonStr(msg, 'error');
+          this.callbacks.onInputError?.(error === 'control_disabled' ? '电脑已关闭远程键鼠控制' : `电脑点击失败：${error}`);
+        }
       }
       return;
     }

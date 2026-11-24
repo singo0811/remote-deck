@@ -1,4 +1,6 @@
 import zlib from 'node:zlib';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 function crc32(buf) {
   let c = 0xffffffff;
@@ -23,7 +25,22 @@ function pngChunk(type, data) {
 /**
  * Generate a crisp 32x32 RGBA PNG icon buffer with no external image files required.
  */
+let cachedIcon = null;
+
+/** Brand icon shipped with the desktop app (falls back to the drawn mark). */
 export function buildAppIconPng(size = 32) {
+  try {
+    if (!cachedIcon) {
+      const file = fileURLToPath(new URL('../assets/tray-64.png', import.meta.url));
+      cachedIcon = fs.readFileSync(file);
+    }
+    return cachedIcon;
+  } catch {
+    return drawFallbackIcon(size);
+  }
+}
+
+function drawFallbackIcon(size = 32) {
   const raw = Buffer.alloc(size * (1 + size * 4));
   const r = size / 2;
 

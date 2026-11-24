@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"os"
@@ -12,6 +13,27 @@ import (
 	"testing"
 	"time"
 )
+
+func TestAccessUnitsKeepDecoderConfigOnEveryIDR(t *testing.T) {
+	sps := []byte{0, 0, 0, 1, 0x67, 0xaa}
+	pps := []byte{0, 0, 1, 0x68, 0xbb}
+	idr := []byte{0, 0, 0, 1, 0x45, 0x80}
+	delta := []byte{0, 0, 1, 0x41, 0x80}
+	stream := bytes.Join([][]byte{sps, pps, idr, delta, idr}, nil)
+	var keys, count int
+	pumpVideoPackets(bytes.NewReader(stream), func(meta, payload []byte) {
+		count++
+		if bytes.Contains(meta, []byte(`"key":true`)) {
+			keys++
+			if !bytes.Equal(payload, bytes.Join([][]byte{sps, pps, idr}, nil)) {
+				t.Errorf("IDR missing decoder configuration: %x", payload)
+			}
+		}
+	}, 640, 480)
+	if keys != 2 || count != 3 {
+		t.Fatalf("got %d keyframes in %d access units", keys, count)
+	}
+}
 
 // Produces real H.264 access units and verifies them by decoding with ffmpeg.
 func TestVideoEncoderProducesDecodableStream(t *testing.T) {
@@ -168,7 +190,7 @@ func TestAnnexBSplitterGroupsAccessUnits(t *testing.T) {
 		_, _ = pw.Write(stream)
 		_ = pw.Close()
 	}()
-	pumpVideoPackets(pr, func(_, _ []byte) { count++ })
+	pumpVideoPackets(pr, func(_, _ []byte) { count++ }, 640, 480)
 	_ = pr.Close()
 	if count != 3 {
 		t.Fatalf("expected 3 access units (IDR + 2 P slices), got %d", count)
@@ -176,7 +198,6 @@ func TestAnnexBSplitterGroupsAccessUnits(t *testing.T) {
 }
 
 var _ = binary.BigEndian
-
 
 // The encoder budget used to be one hardcoded value for every preset, which made
 // 超清 look soft and 流畅 still saturate a WAN link.

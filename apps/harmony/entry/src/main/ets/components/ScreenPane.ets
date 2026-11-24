@@ -243,6 +243,8 @@ export struct ScreenPane {
     const rc = tsnetBridge.videoPush(data, ptsUs, meta.key, meta.width, meta.height);
     if (rc === 0) {
       this.client?.setCodec('jpeg');
+    } else if (rc === 2) {
+      this.client?.requestKeyFrame();
     } else if (meta.width > 0 && meta.height > 0) {
       this.xCompVideoW = meta.width;
       this.xCompVideoH = meta.height;
@@ -819,14 +821,7 @@ export struct ScreenPane {
           this.localCursorX = pt.x;
           this.localCursorY = pt.y;
           this.lastLocalCursorMs = now;
-          // Move first, then click: magnification docks (e.g. MyDockFinder) shift
-          // icons while animating, so an immediate click can hit a neighbour.
-          this.client.sendMouse('move', pt.x, pt.y, 'left');
-          const tapX = pt.x;
-          const tapY = pt.y;
-          setTimeout(() => {
-            this.client?.sendMouse('click', tapX, tapY, 'left');
-          }, 60);
+          this.client.sendMouse('click', pt.x, pt.y, 'left');
           this.showRipple(this.downX, this.downY, '#38BDF8');
         } else {
           this.lastLocalCursorMs = now;

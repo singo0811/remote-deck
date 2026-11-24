@@ -23,29 +23,26 @@ type videoRoiMeta struct {
 }
 
 var (
-	videoMu      sync.Mutex
-	videoCmd     *exec.Cmd
-	videoIn      io.WriteCloser
-	videoRoiCur  *videoRoiMeta
-	videoRunning atomic.Bool
-	videoW       int
-	videoH       int
-	videoFPS     int
-	videoKbps    int
-	videoStarts  atomic.Uint64
-	videoSeq     uint64
-	videoStderr  boundedBuffer
+	videoMu          sync.Mutex
+	videoCmd         *exec.Cmd
+	videoDone        chan struct{}
+	videoIn          io.WriteCloser
+	videoRoiMu       sync.Mutex
+	videoRoiCur      *videoRoiMeta
+	videoRunning     atomic.Bool
+	videoW           int
+	videoH           int
+	videoFPS         int
+	videoKbps        int
+	videoStarts      atomic.Uint64
+	videoSeq         atomic.Uint64
+	videoEncoderName string
 )
 
 func setVideoRoiMeta(roi *videoRoiMeta) {
-	videoMu.Lock()
-	if roi == nil {
-		videoRoiCur = nil
-	} else {
-		cp := *roi
-		videoRoiCur = &cp
-	}
-	videoMu.Unlock()
+	videoRoiMu.Lock()
+	defer videoRoiMu.Unlock()
+	videoRoiCur = roi
 }
 
 // boundedBuffer keeps the tail of ffmpeg's stderr for diagnostics.
@@ -74,21 +71,15 @@ func (b *boundedBuffer) String() string {
 	return string(b.data)
 }
 
-func (b *boundedBuffer) Reset() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.data = nil
-}
-
 func videoEncoderAvailable() bool {
 	_, err := exec.LookPath("ffmpeg")
 	return err == nil
 }
 
-func startFfmpegVideoCmd(args []string, withStdin bool, w, h, fps int) error {
+func startFfmpegVideoCmd(args []string, withStdin bool, w, h, fps, kbps int) error {
 	cmd := exec.Command("ffmpeg", args...)
-	videoStderr.Reset()
-	cmd.Stderr = &videoStderr
+	stderr := &boundedBuffer{}
+	cmd.Stderr = stderr
 	var stdin io.WriteCloser
 	if withStdin {
 		var err error
@@ -116,13 +107,21 @@ func startFfmpegVideoCmd(args []string, withStdin bool, w, h, fps int) error {
 	videoW = w
 	videoH = h
 	videoFPS = fps
+	videoKbps = kbps
 	videoRunning.Store(true)
 
-	go pumpVideoPackets(stdout, videoEmit)
+	done := make(chan struct{})
+	videoDone = done
 	go func() {
+		pumpVideoPackets(stdout, func(meta, payload []byte) {
+			if videoRunning.Load() {
+				videoEmit(meta, payload)
+			}
+		}, w, h)
 		err := cmd.Wait()
 		videoRunning.Store(false)
-		tail := videoStderr.String()
+		close(done)
+		tail := stderr.String()
 		if err != nil && tail != "" {
 			writeJSONFrame(evtJSON, map[string]any{"op": "video_error", "error": tail})
 		} else {
@@ -173,10 +172,7 @@ func encoderCrf(quality int) int {
 func startVideoEncoderIfNeeded(w, h, fps, quality int) error {
 	videoMu.Lock()
 	target := encoderTargetKbps(w, h, fps, quality)
-	need := !videoRunning.Load() || videoW != w || videoH != h || videoKbps != target
-	if need {
-		videoKbps = target
-	}
+	need := !videoRunning.Load() || videoW != w || videoH != h || videoFPS != fps || videoKbps != target
 	prevW, prevH, prevKbps := videoW, videoH, videoKbps
 	videoMu.Unlock()
 	if !need {
@@ -217,20 +213,14 @@ func stopVideoEncoderLocked() {
 		videoIn = nil
 	}
 	if videoCmd != nil {
-		done := make(chan struct{})
-		go func(cmd *exec.Cmd) {
-			_ = cmd.Wait()
-			close(done)
-		}(videoCmd)
 		select {
-		case <-done:
+		case <-videoDone:
 		case <-time.After(600 * time.Millisecond):
-			if videoCmd.Process != nil {
-				_ = videoCmd.Process.Kill()
-			}
-			<-done
+			_ = videoCmd.Process.Kill()
+			<-videoDone
 		}
 		videoCmd = nil
+		videoDone = nil
 	}
 }
 
@@ -268,32 +258,28 @@ var videoEmit = func(metaBytes, payload []byte) {
 
 // pumpVideoPackets groups the Annex-B byte stream into access units and emits
 // one binary frame per AU so the client can build EncodedVideoChunks.
-func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte)) {
+func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte), width, height int) {
 	buf := make([]byte, 256*1024)
 	acc := make([]byte, 0, 512*1024)
 	var au bytes.Buffer
-	auHasVCL := false
+	auHasVCL, auHasIDR := false, false
+	var sps, pps []byte
+	var auHasSPS, auHasPPS bool
 	flush := func() {
-		if au.Len() == 0 {
+		if !auHasVCL {
 			return
-		}
-		videoSeq += 1
-		hasKey := false
-		if bytes.Contains(au.Bytes(), []byte{0x00, 0x00, 0x01, 0x65}) ||
-			bytes.Contains(au.Bytes(), []byte{0x00, 0x00, 0x00, 0x01, 0x65}) {
-			hasKey = true
 		}
 		metaMap := map[string]any{
 			"codec":  "h264",
-			"key":    hasKey,
-			"seq":    videoSeq,
+			"key":    auHasIDR,
+			"seq":    videoSeq.Add(1),
 			"ts":     time.Now().UnixMilli(),
-			"width":  videoW,
-			"height": videoH,
+			"width":  width,
+			"height": height,
 		}
-		videoMu.Lock()
+		videoRoiMu.Lock()
 		roiSnap := videoRoiCur
-		videoMu.Unlock()
+		videoRoiMu.Unlock()
 		if roiSnap != nil {
 			metaMap["fullWidth"] = roiSnap.FullWidth
 			metaMap["fullHeight"] = roiSnap.FullHeight
@@ -306,9 +292,44 @@ func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte)) {
 		}
 		meta, _ := json.Marshal(metaMap)
 		payload := au.Bytes()
+		if auHasIDR && (!auHasSPS || !auHasPPS) && len(sps) > 0 && len(pps) > 0 {
+			withConfig := make([]byte, 0, len(sps)+len(pps)+len(payload))
+			withConfig = append(withConfig, sps...)
+			withConfig = append(withConfig, pps...)
+			payload = append(withConfig, payload...)
+		}
 		emit(meta, payload)
 		au.Reset()
-		auHasVCL = false
+		auHasVCL, auHasIDR, auHasSPS, auHasPPS = false, false, false, false
+	}
+	consume := func(nal []byte) {
+		header := startCodeLen(nal)
+		if header >= len(nal) {
+			return
+		}
+		nalType := nal[header] & 0x1f
+		isVCL := nalType >= 1 && nalType <= 5
+		if isVCL {
+			// Multiple slices of the same picture belong to one access unit.
+			if mb, ok := firstMbInSlice(nal); !ok || mb == 0 {
+				flush()
+			}
+		} else if nalType >= 6 && nalType <= 9 {
+			// Prefix NALs belong with the next picture, including IDR headers.
+			flush()
+		}
+		switch nalType {
+		case 5:
+			auHasIDR = true
+		case 7:
+			sps = append(sps[:0], nal...)
+			auHasSPS = true
+		case 8:
+			pps = append(pps[:0], nal...)
+			auHasPPS = true
+		}
+		au.Write(nal)
+		auHasVCL = auHasVCL || isVCL
 	}
 
 	for {
@@ -321,7 +342,7 @@ func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte)) {
 				if start < 0 {
 					break
 				}
-				next := findStartCode(acc, start+3)
+				next := findStartCode(acc, start+startCodeLen(acc[start:]))
 				if next < 0 {
 					// Keep the partial NAL for the next read.
 					acc = acc[start:]
@@ -329,41 +350,14 @@ func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte)) {
 				}
 				nal := acc[start:next]
 				acc = acc[next:]
-				nalType := int(nal[startCodeLen(nal)] & 0x1f)
-				isVCL := nalType >= 1 && nalType <= 5
-				// x264 with sliced-threads emits several slices per picture; only a
-				// slice whose first_mb_in_slice is 0 starts a new access unit.
-				startsNewPicture := isVCL
-				if isVCL {
-					if mb, ok := firstMbInSlice(nal); ok && mb > 0 {
-						startsNewPicture = false
-					}
-				}
-				if startsNewPicture && auHasVCL {
-					flush()
-				}
-				au.Write(nal)
-				if isVCL {
-					auHasVCL = true
-				}
+				consume(nal)
 			}
 		}
 		if err != nil {
 			// Flush the trailing NAL (held back while waiting for its end) too,
 			// keeping the same access-unit boundaries as the streaming path.
-			if len(acc) > 0 {
-				nalType := int(acc[startCodeLen(acc)] & 0x1f)
-				if nalType >= 1 && nalType <= 5 && auHasVCL {
-					newPicture := true
-					if mb, ok := firstMbInSlice(acc); ok && mb > 0 {
-						newPicture = false
-					}
-					if newPicture {
-						flush()
-					}
-				}
-				au.Write(acc)
-				acc = nil
+			if start := findStartCode(acc, 0); start >= 0 {
+				consume(acc[start:])
 			}
 			flush()
 			return
@@ -373,7 +367,8 @@ func pumpVideoPackets(r io.Reader, emit func(metaBytes, payload []byte)) {
 
 func findStartCode(b []byte, from int) int {
 	for i := from; i+3 <= len(b); i++ {
-		if b[i] == 0x00 && b[i+1] == 0x00 && b[i+2] == 0x01 {
+		if b[i] == 0 && b[i+1] == 0 && (b[i+2] == 1 ||
+			(i+4 <= len(b) && b[i+2] == 0 && b[i+3] == 1)) {
 			return i
 		}
 	}

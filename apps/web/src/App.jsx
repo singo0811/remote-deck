@@ -10,6 +10,7 @@ import { RemoteCanvas } from './components/RemoteCanvas.jsx';
 import { TerminalPanel } from './components/TerminalPanel.jsx';
 import { FilePanel } from './components/FilePanel.jsx';
 import { PhoneMirrorPane } from './components/PhoneMirrorPane.jsx';
+import { getToken as getAccountToken, bindDevice as bindAccountDevice, consumeTokenFromUrl as consumeAccountTokenFromUrl } from './lib/account.js';
 
 const QUALITY_PRESETS = {
   auto: { fps: 20, scale: 0.9, quality: 82, auto: true },
@@ -87,6 +88,18 @@ export function App() {
   const activeDisplayIdRef = useRef(0);
   const shellRef = useRef(null);
   const utf8Decoder = useRef(new TextDecoder());
+
+  useEffect(() => {
+    // WeChat login returns here with ?account_token=...; store it and clean the URL.
+    const result = consumeAccountTokenFromUrl();
+    if (result === 'wechat_failed') {
+      setToast('微信登录未完成');
+      setTimeout(() => setToast((cur) => (cur === '微信登录未完成' ? '' : cur)), 3000);
+    } else if (result) {
+      setToast('已登录');
+      setTimeout(() => setToast((cur) => (cur === '已登录' ? '' : cur)), 2500);
+    }
+  }, []);
 
   useEffect(() => {
     audioEnabledRef.current = audioEnabled;
@@ -188,9 +201,9 @@ export function App() {
       },
       onTelemetry: (stats) => setTelemetry(stats),
       onChannelUpgrade: (channel) => {
-        setSessionInfo((prev) => (prev ? { ...prev, channel } : prev));
-        notify(`链路已升级为 ${channel === 'webrtc' ? 'WebRTC P2P 直连' : channel}`);
+        notify(`链路已升级为 ${channel === 'webrtc' ? 'WebRTC' : channel}`);
       },
+      onVideoDiscontinuity: () => videoRef.current?.reset(),
       onAuthenticated: (authInfo, channel) => {
         setReconnectMsg('');
         setConnState('connected');
@@ -369,6 +382,10 @@ export function App() {
         pin,
         tunnelUrl,
       });
+      // Bind the target device to the signed-in account so it shows up under 我的.
+      const accountToken = getAccountToken();
+      const boundId = t.sessionInfo?.deviceId || deviceId;
+      if (accountToken && boundId) bindAccountDevice(boundId, accountToken).catch(() => {});
     } catch (err) {
       setConnState('idle');
       setErrorMsg(err.message || '连接失败');

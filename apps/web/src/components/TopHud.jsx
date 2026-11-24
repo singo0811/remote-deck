@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
 
 const CHANNEL_LABEL = {
-  lan: { text: '内网直连', cls: 'badge-lan' },
-  tailscale: { text: 'P2P 组网', cls: 'badge-lan' },
-  tunnel: { text: '外网隧道', cls: 'badge-relay' },
-  webrtc: { text: 'P2P 直连', cls: 'badge-p2p' },
-  relay: { text: '云端中继', cls: 'badge-relay' },
+  lan: { text: '局域网', cls: 'badge-lan' },
+  tailscale: { text: '组网', cls: 'badge-lan' },
+  tunnel: { text: '公网', cls: 'badge-relay' },
+  webrtc: { text: '直连', cls: 'badge-p2p' },
+  relay: { text: '公网', cls: 'badge-relay' },
 };
 
 const SYSTEM_SHORTCUTS = [

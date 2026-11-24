@@ -11,6 +11,10 @@ import {
   FRAME_KIND,
   MSG,
   PERMISSIONS,
+  RTC_VIDEO_CHANNEL,
+  RTC_VIDEO_MAX_FRAME,
+  RTC_VIDEO_READY,
+  packetizeRtcVideo,
   collectLocalAddresses,
   decodeBinaryEnvelope,
   encodeBinaryEnvelope,
@@ -143,8 +147,6 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024; // 4 MiB backpressure limit
  * delay.
  */
 const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
-// Set when a frame was skipped for latency; the next capture then emits a keyframe
-// so the client resynchronises instead of showing a broken picture.
 
 /** Channel classes: how much we trust a transport path for realtime video. */
 function channelProfile(channel) {
@@ -152,7 +154,7 @@ function channelProfile(channel) {
     case 'relay':
       return { qualityFactor: 0.55, maxWidthCap: 1600, fpsCap: 24 };
     case 'tunnel':
-      return { qualityFactor: 0.5, maxWidthCap: 1440, fpsCap: 22 };
+      return { qualityFactor: 0.85, maxWidthCap: 1920, fpsCap: 18 };
     case 'tailscale':
       return { qualityFactor: 0.9, maxWidthCap: 0, fpsCap: 0 };
     case 'webrtc':
@@ -160,16 +162,6 @@ function channelProfile(channel) {
     default:
       return { qualityFactor: 1, maxWidthCap: 0, fpsCap: 0 };
   }
-}
-
-/** The least capable channel among the clients watching the stream. */
-function worstChannel(channels) {
-  const rank = { lan: 0, webrtc: 0, tailscale: 1, relay: 2, tunnel: 3 };
-  let worst = 'lan';
-  for (const ch of channels) {
-    if ((rank[ch] ?? 0) > (rank[worst] ?? 0)) worst = ch;
-  }
-  return worst;
 }
 
 /**
@@ -248,6 +240,26 @@ function timingLog(rec) {
   } catch {}
 }
 
+/**
+ * Users paste the public site address (https://host) into the relay field. The
+ * relay speaks WebSocket at /ws, so accept http(s), ws(s) and bare hostnames
+ * instead of failing the whole relay connection on an invalid scheme.
+ */
+export function normalizeRelayWsUrl(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  let url;
+  try {
+    url = new URL(raw.includes('://') ? raw : `https://${raw}`);
+  } catch {
+    return raw;
+  }
+  if (url.protocol === 'https:') url.protocol = 'wss:';
+  else if (url.protocol === 'http:') url.protocol = 'ws:';
+  if (url.pathname === '/' || url.pathname === '') url.pathname = '/ws';
+  return url.toString();
+}
+
 function wrapWsTransport(ws, channelName) {
   try {
     ws._socket?.setNoDelay?.(true);
@@ -286,6 +298,29 @@ function wrapDataChannelTransport(dc) {
         dc.close();
       } catch {}
     },
+  };
+}
+
+function wrapVideoDataChannel(dc) {
+  let seq = 0;
+  let needsKey = true;
+  return {
+    isOpen: () => dc.readyState === 'open',
+    sendFrame: (frame, key) => {
+      seq += 1;
+      if ((needsKey && !key) || frame.byteLength > RTC_VIDEO_MAX_FRAME ||
+          dc.bufferedAmount + (key ? 0 : frame.byteLength) > VIDEO_LATENCY_BUDGET_BYTES) {
+        needsKey = true;
+        return;
+      }
+      try {
+        for (const packet of packetizeRtcVideo(seq, frame)) dc.send(Buffer.from(packet));
+        needsKey = false;
+      } catch {
+        needsKey = true;
+      }
+    },
+    close: () => dc.close(),
   };
 }
 
@@ -390,8 +425,8 @@ export class HostAgent {
     this.audioSessions = new Set();
     /** @type {Set<any>} */
     this.clipboardWatchers = new Set();
-    /** @type {Set<any>} */
-    this.videoSessions = new Set();
+    this.videoOwner = null;
+    this.videoCapture = null;
     /** @type {Map<string, any>} */
     this.rtcPeers = new Map(); // sessionId -> { pc, pendingCandidates }
     /** @type {Map<string, any>} */
@@ -443,18 +478,23 @@ export class HostAgent {
     });
 
     this.native.on('video_packet', ({ meta, data }) => {
-      if (this.videoSessions.size === 0 || !data || data.length === 0) return;
+      const sess = this.videoOwner;
+      if (!sess?.transport.isOpen() || !data?.length) return;
+      if (this.videoCapture && (this.videoCapture.stop || this.videoCapture.session !== sess)) return;
       const envelope = encodeBinaryEnvelope(FRAME_KIND.VIDEO, meta || {}, data);
-      for (const sess of this.videoSessions) {
-        if (!sess.transport.isOpen()) continue;
+      if (sess.videoTransport?.isOpen()) {
+        sess.videoTransport.sendFrame(envelope, Boolean(meta?.key));
+      } else if (sess.transport.channelName === 'tunnel' || sess.transport.channelName === 'relay') {
         const queued = sess.transport.getBufferedAmount();
-        // Drop when the queue would add visible delay. Requesting a keyframe on
-        // the way out keeps the picture recoverable instead of frozen.
-        // Dropping is preferable to queueing: a long queue is just accumulated
-        // delay. Recovery is left to the periodic IDR and the client's own
-        // full-frame request — forcing a keyframe here makes things worse,
-        // because the keyframe is the largest frame and refills the queue.
-        if (queued > VIDEO_LATENCY_BUDGET_BYTES && !meta?.key) continue;
+        const key = Boolean(meta?.key);
+        if (queued > VIDEO_LATENCY_BUDGET_BYTES) {
+          sess.waitingForVideoKey = true;
+          return;
+        }
+        if (sess.waitingForVideoKey && !key) return;
+        sess.waitingForVideoKey = false;
+        sess.transport.sendBinary(envelope);
+      } else if (sess.transport.getBufferedAmount() <= VIDEO_LATENCY_BUDGET_BYTES || meta?.key) {
         sess.transport.sendBinary(envelope);
       }
     });
@@ -813,7 +853,7 @@ export class HostAgent {
     this.audioSessions.clear();
     this.clipboardWatchers.clear();
     this.clipboardWatchActive = false;
-    this.videoSessions.clear();
+    this.videoOwner = null;
     this.captureBridge.stopVideo?.();
     void this.native.setClipboardWatch?.(false);
     if (this.privacyEnabled) {
@@ -1059,7 +1099,10 @@ export class HostAgent {
         return;
       }
       this.wss.handleUpgrade(req, socket, head, (ws) => {
-        this.#attachSession(wrapWsTransport(ws, 'lan'), ws);
+        const ip = socket.remoteAddress;
+        const localProxy = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+        const channel = localProxy && req.headers['cf-ray'] ? 'tunnel' : 'lan';
+        this.#attachSession(wrapWsTransport(ws, channel), ws);
       });
     });
 
@@ -1174,7 +1217,7 @@ export class HostAgent {
 
   #connectRelay() {
     if (this.stopped || !this.relayUrl) return;
-    const ws = new WebSocket(this.relayUrl);
+    const ws = new WebSocket(normalizeRelayWsUrl(this.relayUrl));
     this.relayWs = ws;
 
     ws.on('open', () => {
@@ -1258,7 +1301,7 @@ export class HostAgent {
 
   #handleRelaySessionRequest(sessionId, iceServers) {
     // 1. Open dedicated relay session data WebSocket for seamless fallback
-    const u = new URL(this.relayUrl);
+    const u = new URL(normalizeRelayWsUrl(this.relayUrl));
     u.searchParams.set('role', 'agent-session');
     u.searchParams.set('sessionId', sessionId);
     u.searchParams.set('deviceId', this.deviceId);
@@ -1266,7 +1309,9 @@ export class HostAgent {
 
     const sessionWs = new WebSocket(u.toString());
     sessionWs.on('open', () => {
-      this.#attachSession(wrapWsTransport(sessionWs, 'relay'), sessionWs);
+      const entry = this.rtcPeers.get(sessionId);
+      if (entry) entry.relaySession = this.#attachSession(wrapWsTransport(sessionWs, 'relay'), sessionWs);
+      else this.#attachSession(wrapWsTransport(sessionWs, 'relay'), sessionWs);
     });
     sessionWs.on('error', () => {});
 
@@ -1299,7 +1344,7 @@ export class HostAgent {
         const attachOnce = () => {
           if (attached) return;
           attached = true;
-          this.#attachDataChannelSession(transport, dc);
+          this.#attachDataChannelSession(transport, dc, entry);
         };
         if (dc.readyState === 'open') {
           attachOnce();
@@ -1368,10 +1413,35 @@ export class HostAgent {
     ws.on('close', () => session.dispose());
     ws.on('error', () => session.dispose());
     session.start();
+    return session;
   }
 
-  #attachDataChannelSession(transport, dc) {
+  #attachDataChannelSession(transport, dc, entry) {
     const session = this.#createSessionController(transport);
+    let videoDc;
+    let receiverReady = false;
+    const activateVideo = () => {
+      if (receiverReady && transport.isOpen() && videoDc?.readyState === 'open' && !session.videoTransport) {
+        session.videoTransport = wrapVideoDataChannel(videoDc);
+      }
+    };
+    session.prepareVideoTransport = (ready) => {
+      if (ready) {
+        receiverReady = true;
+        activateVideo();
+      } else if (!videoDc) {
+        try {
+          entry.relaySession?.stopScreen();
+          // This werift version treats maxRetransmits: 0 as unlimited in SCTP.
+          // A short packet lifetime also expires data still waiting to be sent.
+          videoDc = entry.pc.createDataChannel(RTC_VIDEO_CHANNEL, { ordered: false, maxPacketLifeTime: 150 });
+          videoDc.onopen = activateVideo;
+        } catch {
+          // The control channel can still carry the video.
+        }
+      }
+    };
+    session.closeVideoTransport = () => videoDc?.close();
     dc.onmessage = (ev) => {
       const raw = ev.data;
       if (typeof raw === 'string') {
@@ -1401,13 +1471,8 @@ export class HostAgent {
     let abrStableTicks = 0;
     let abrCongestTicks = 0;
     let forceKeyPending = false;
-let lastRecoveryKeyAt = 0;
-// streamConfig is shared by every viewer, so a second client sending its own preset
-// made the encoder flip parameters every frame — which restarts the encoder and
-// emits a keyframe each time (a 70 Mbps storm that also starved capture). Only one
-// session owns the stream parameters; others still watch the same stream.
-let streamConfigOwner = null;
-let lastForcedKeyAt = 0;
+    let lastRecoveryKeyAt = 0;
+    let lastForcedKeyAt = 0;
     let h264Congested = false;
     let lastCursorShapeId = 0;
     let lastCursorSentX = -1;
@@ -1454,19 +1519,23 @@ let lastForcedKeyAt = 0;
         transport.close(1000, 'session closed');
         session.dispose();
       },
-      dispose: () => {
+      stopScreen: () => {
         streaming = false;
-        clearTimeout(streamTimer);
+        clearImmediate(streamTimer);
+        stopPacer();
+        releaseVideo();
+        streamConfig.codec = 'jpeg';
+      },
+      dispose: () => {
+        session.stopScreen();
+        session.closeVideoTransport?.();
         session.phoneStream?.close();
         session.phoneStream = null;
         if (!this.sessions.has(session)) return;
         const wasAuthed = authenticated;
         this.sessions.delete(session);
-        if (streamConfigOwner === session) streamConfigOwner = null;
         this.audioSessions.delete(session);
         this.clipboardWatchers.delete(session);
-        this.videoSessions.delete(session);
-        if (this.videoSessions.size === 0) this.captureBridge.stopVideo?.();
         this.#syncClipboardWatch();
         this.#syncAudioStream();
         for (const ptyId of ownedPtys) {
@@ -1577,6 +1646,7 @@ let lastForcedKeyAt = 0;
                 elevated: this.elevated,
                 privacyEnabled: this.privacyEnabled,
                 videoEncoder: this.videoEncoderAvailable,
+                inputAcknowledgements: true,
                 lanEndpoints: this.getLanEndpoints(),
                 tunnelUrl: this.tunnelUrl || '',
               });
@@ -1602,25 +1672,37 @@ let lastForcedKeyAt = 0;
       },
     };
 
+    const releaseVideo = () => {
+      if (this.videoOwner === session) {
+        this.videoOwner = null;
+        if (this.videoCapture?.session === session) {
+          this.videoCapture.stop = true;
+        } else {
+          this.captureBridge.stopVideo?.();
+        }
+      }
+    };
+
     const applyCodec = (next) => {
       const normalized = next === 'h264' ? 'h264' : 'jpeg';
+      if (normalized === 'h264' && this.videoOwner && this.videoOwner !== session) {
+        session.sendJson({ type: MSG.SCREEN_CONFIG, codec: 'jpeg', videoError: 'H.264 编码器正在服务另一个会话' });
+        return;
+      }
       if (normalized === streamConfig.codec) return;
       streamConfig.codec = normalized;
       lastHash = '';
       if (normalized === 'h264') {
-        this.videoSessions.add(session);
+        this.videoOwner = session;
+        forceKeyPending = true;
       } else {
-        this.videoSessions.delete(session);
-        if (this.videoSessions.size === 0) this.captureBridge.stopVideo?.();
+        releaseVideo();
       }
       session.sendJson({ type: MSG.SCREEN_CONFIG, codec: streamConfig.codec });
     };
 
     const getEffectiveStreamParams = () => {
-      const channels = [];
-      for (const sess of this.videoSessions) channels.push(sess.transport?.channelName || 'lan');
-      if (channels.length === 0) channels.push(streamConfig.channelHint || 'lan');
-      return effectiveStreamParams(streamConfig, { abrLevel, channel: worstChannel(channels) });
+      return effectiveStreamParams(streamConfig, { abrLevel, channel: transport.channelName });
     };
 
     // Absolute-deadline pacing: the deadline advances by exactly one interval and
@@ -1674,16 +1756,6 @@ let lastForcedKeyAt = 0;
     };
     const scheduleNextFrame = () => {
       if (!streaming || !transport.isOpen()) return;
-      // Exactly one session may drive capture. Each connection has its own
-      // streamConfig and pacer, so two viewers used to run two capture loops
-      // against one encoder: the dimensions alternated every frame, which
-      // restarted the encoder and emitted a keyframe each time (70+ Mbps, plus
-      // "Screen capture timed out"). A non-owner simply stops capturing and
-      // receives the owner's frames through the shared video fan-out.
-      if (streamConfigOwner !== session) {
-        streaming = false;
-        return;
-      }
       const eff = getEffectiveStreamParams();
       const nominal = Math.max(20, Math.round(1000 / Math.max(1, Math.min(30, eff.fps))));
       // Leave at least ~10ms of sleep so timers stay on schedule instead of
@@ -1712,16 +1784,6 @@ let lastForcedKeyAt = 0;
       const wakeAt = Date.now();
       const wakeLag = schedAt ? wakeAt - schedAt - schedDelay : -1;
       if (!streaming || !transport.isOpen()) return;
-      // Exactly one session may drive capture. Each connection has its own
-      // streamConfig and pacer, so two viewers used to run two capture loops
-      // against one encoder: the dimensions alternated every frame, which
-      // restarted the encoder and emitted a keyframe each time (70+ Mbps, plus
-      // "Screen capture timed out"). A non-owner simply stops capturing and
-      // receives the owner's frames through the shared video fan-out.
-      if (streamConfigOwner !== session) {
-        streaming = false;
-        return;
-      }
       if (schedAt) {
         const lag = Date.now() - schedAt - schedDelay;
         timerLagEma = timerLagEma * 0.75 + Math.max(-5, Math.min(40, lag)) * 0.25;
@@ -1732,7 +1794,18 @@ let lastForcedKeyAt = 0;
         return;
       }
       const buffered = transport.getBufferedAmount();
-      if (streamConfig.codec === 'h264') {
+      const h264 = streamConfig.codec === 'h264';
+      if (h264 && this.videoCapture) {
+        // Let the previous encoder owner finish its last native request before handoff.
+        capturing = true;
+        try { await this.videoCapture.request; } catch {}
+        capturing = false;
+        scheduleNextFrame();
+        return;
+      }
+      const rtcVideo = h264 && session.videoTransport?.isOpen();
+      const wanSocket = transport.channelName === 'tunnel' || transport.channelName === 'relay';
+      if (h264 && !rtcVideo && !wanSocket) {
         if (buffered > 524288) {
           h264Congested = true;
           scheduleNextFrame();
@@ -1763,14 +1836,15 @@ let lastForcedKeyAt = 0;
       }
 
       if (streamConfig.auto) {
-        if (buffered > 1572864 || clientRttMs > 300) {
+        const congested = wanSocket ? buffered > VIDEO_LATENCY_BUDGET_BYTES : buffered > 1572864 || clientRttMs > 300;
+        if (congested) {
           abrCongestTicks = (typeof abrCongestTicks === 'number' ? abrCongestTicks : 0) + 1;
           if ((abrCongestTicks >= 2 || buffered > 2621440) && abrLevel < 3) {
             abrLevel += 1;
             abrCongestTicks = 0;
           }
           abrStableTicks = 0;
-        } else if (buffered < 131072 && clientRttMs < 120) {
+        } else if (buffered < 131072 && (wanSocket || clientRttMs < 120)) {
           abrCongestTicks = 0;
           abrStableTicks += 1;
           if (abrStableTicks >= 18 && abrLevel > 0) {
@@ -1792,7 +1866,7 @@ let lastForcedKeyAt = 0;
         const capStart = Date.now();
         const sendForceKey = forceKeyPending;
         forceKeyPending = false;
-        const { meta, jpeg } = await this.captureBridge.captureFrame({
+        const request = this.captureBridge.captureFrame({
           displayId: streamConfig.displayId,
           scale: captureScale,
           maxWidth: eff.maxWidth || 0,
@@ -1800,7 +1874,8 @@ let lastForcedKeyAt = 0;
           separateCursor: Boolean(streamConfig.separateCursor),
           cursorShapeId: lastCursorShapeId,
           quality: eff.quality,
-          lastHash,
+          // Keep the GOP advancing on a static desktop so a lost keyframe can recover.
+          lastHash: h264 && (rtcVideo || wanSocket) ? '' : lastHash,
           seq: frameSeq,
           allowDirty: Boolean(streamConfig.allowDirty),
           forceKey: sendForceKey,
@@ -1813,6 +1888,9 @@ let lastForcedKeyAt = 0;
           roiW: streamConfig.roi ? streamConfig.roi.w : 0,
           roiH: streamConfig.roi ? streamConfig.roi.h : 0,
         });
+        if (h264) this.videoCapture = { session, request, stop: false };
+        const { meta, jpeg } = await request;
+        if (!streaming || (h264 && this.videoCapture.stop)) return;
         lastHash = meta.hash || '';
         if (meta.cursorShape && meta.cursorShape.id) {
           lastCursorShapeId = meta.cursorShape.id;
@@ -1910,10 +1988,9 @@ let lastForcedKeyAt = 0;
         }
       } catch (err) {
         // H.264 unavailable (e.g. ffmpeg missing) -> fall back to JPEG silently.
-        if (streamConfig.codec === 'h264') {
+        if (h264 && streaming && !this.videoCapture?.stop && streamConfig.codec === 'h264') {
           streamConfig.codec = 'jpeg';
-          this.videoSessions.delete(session);
-          if (this.videoSessions.size === 0) this.captureBridge.stopVideo?.();
+          releaseVideo();
           lastHash = '';
           session.sendJson({
             type: MSG.SCREEN_CONFIG,
@@ -1923,6 +2000,10 @@ let lastForcedKeyAt = 0;
         }
         // Keep streaming loop alive on transient frame grab error
       } finally {
+        if (h264 && this.videoCapture?.session === session) {
+          if (this.videoCapture.stop) this.captureBridge.stopVideo?.();
+          this.videoCapture = null;
+        }
         capturing = false;
         scheduleNextFrame();
       }
@@ -1931,6 +2012,10 @@ let lastForcedKeyAt = 0;
     let lastPointerEcho = null;
     const handleAuthedMessage = async (msg) => {
       switch (msg.type) {
+        case RTC_VIDEO_READY: {
+          if (this.permissions.view) session.prepareVideoTransport?.(msg.ready === true);
+          return;
+        }
         case MSG.SCREEN_DISPLAYS: {
           const displays = await this.refreshDisplays();
           session.sendJson({ type: MSG.DISPLAYS_INFO, displays });
@@ -1938,14 +2023,6 @@ let lastForcedKeyAt = 0;
         }
         case MSG.SCREEN_START: {
           if (!this.permissions.view) return;
-          if (streamConfigOwner && streamConfigOwner !== session) {
-            // Another viewer owns the stream: do not re-configure it, just let
-            // this client attach to what is already being encoded.
-            this.videoSessions.add(session);
-            session.sendJson({ type: MSG.SCREEN_CONFIG, codec: streamConfig.codec });
-            return;
-          }
-          streamConfigOwner = session;
           if (typeof msg.displayId === 'number') streamConfig.displayId = msg.displayId;
           if (typeof msg.fps === 'number') streamConfig.fps = msg.fps;
           if (typeof msg.scale === 'number') streamConfig.scale = msg.scale;
@@ -1975,8 +2052,7 @@ let lastForcedKeyAt = 0;
           return;
         }
         case MSG.SCREEN_CONFIG: {
-          if (streamConfigOwner && streamConfigOwner !== session) return;
-          streamConfigOwner = session;
+          if (!this.permissions.view) return;
           if (typeof msg.displayId === 'number') {
             streamConfig.displayId = msg.displayId;
             lastHash = '';
@@ -2039,11 +2115,7 @@ let lastForcedKeyAt = 0;
           return;
         }
         case MSG.SCREEN_STOP: {
-          stopPacer();
-          streaming = false;
-          clearTimeout(streamTimer);
-          this.videoSessions.delete(session);
-          if (this.videoSessions.size === 0) this.captureBridge.stopVideo?.();
+          session.stopScreen();
           return;
         }
         case MSG.AUDIO_START: {
@@ -2066,11 +2138,13 @@ let lastForcedKeyAt = 0;
 
         // Input injection
         case MSG.INPUT_MOUSE: {
-          if (typeof msg.x === 'number' && typeof msg.y === 'number') {
-            lastPointerEcho = { x: msg.x, y: msg.y, action: msg.action, ts: Date.now() };
+          const acknowledge = Number.isSafeInteger(msg.inputId) && msg.action === 'click';
+          const reply = (ok, error) => session.sendJson({ type: 'input_result', inputId: msg.inputId, ok, error });
+          if (!this.permissions.control) {
+            if (acknowledge) reply(false, 'control_disabled');
+            return;
           }
-          if (!this.permissions.control) return;
-          this.native.injectMouse({
+          const request = {
             action: msg.action,
             x: msg.x ?? -1,
             y: msg.y ?? -1,
@@ -2079,7 +2153,16 @@ let lastForcedKeyAt = 0;
             button: msg.button || 'left',
             deltaY: msg.deltaY ?? msg.delta ?? 0,
             displayId: msg.displayId ?? streamConfig.displayId,
-          });
+          };
+          try {
+            await this.native.injectMouse(request, acknowledge);
+            if (Number.isFinite(msg.x) && Number.isFinite(msg.y)) {
+              lastPointerEcho = { x: msg.x, y: msg.y, action: msg.action, ts: Date.now() };
+            }
+            if (acknowledge) reply(true);
+          } catch (err) {
+            if (acknowledge) reply(false, err.message);
+          }
           return;
         }
         case MSG.INPUT_KEY: {
