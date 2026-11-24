@@ -184,19 +184,28 @@ func startVideoEncoderIfNeeded(w, h, fps, quality int) error {
 	}
 	// Emit why the encoder restarted: a restart costs a keyframe, so a per-frame
 	// restart looks like a keyframe storm on the wire.
+	err := startVideoEncoder(w, h, fps, quality)
+	// Report after the fact: the encoder name is only known once start runs, and
+	// knowing whether we fell back to software x264 is the first question when the
+	// stream feels heavy.
+	videoMu.Lock()
+	name := videoEncoderName
+	videoMu.Unlock()
 	writeJSONFrame(evtJSON, map[string]any{
-		"op":    "video_start",
-		"w":     w,
-		"h":     h,
-		"fps":   fps,
-		"kbps":  target,
-		"crf":   encoderCrf(quality),
-		"prevW": prevW,
-		"prevH": prevH,
-		"prevK": prevKbps,
-		"seq":   videoStarts.Add(1),
+		"op":      "video_start",
+		"w":       w,
+		"h":       h,
+		"fps":     fps,
+		"kbps":    target,
+		"crf":     encoderCrf(quality),
+		"encoder": name,
+		"prevW":   prevW,
+		"prevH":   prevH,
+		"prevK":   prevKbps,
+		"seq":     videoStarts.Add(1),
+		"error":   fmt.Sprint(err),
 	})
-	return startVideoEncoder(w, h, fps, quality)
+	return err
 }
 
 func stopVideoEncoderLocked() {

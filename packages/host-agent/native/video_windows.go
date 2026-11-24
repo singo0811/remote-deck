@@ -10,9 +10,28 @@ import (
 )
 
 var (
-	nvencOnce   sync.Once
-	nvencFastOK bool
+	videoEncoderName = "unknown"
+	nvencOnce        sync.Once
+	nvencFastOK      bool
+	qsvOnce          sync.Once
+	qsvOK            bool
 )
+
+// Intel Quick Sync: hardware H.264 without touching the CPU. MiniRTC-style
+// designs always prefer a hardware encoder; software x264 at 3440x1440 is what
+// makes "外网/超清" feel heavy.
+func useQsvEncoder(ffmpeg string) bool {
+	qsvOnce.Do(func() {
+		cmd := exec.Command(ffmpeg,
+			"-hide_banner", "-loglevel", "error",
+			"-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=0.2",
+			"-c:v", "h264_qsv", "-f", "h264", "pipe:1",
+		)
+		out, err := cmd.Output()
+		qsvOK = err == nil && len(out) > 0
+	})
+	return qsvOK
+}
 
 func useFastNvencEncoder(ffmpeg string) bool {
 	nvencOnce.Do(func() {
@@ -86,7 +105,23 @@ func startVideoEncoder(w, h, fps, quality int) error {
 	bufKbps := maxKbps * 2
 
 	var encoderArgs []string
-	if useFastNvencEncoder("ffmpeg") {
+	if useQsvEncoder("ffmpeg") {
+		videoEncoderName = "h264_qsv"
+		encoderArgs = []string{
+			"-c:v", "h264_qsv",
+			"-preset", "veryfast",
+			"-global_quality", fmt.Sprintf("%d", crf),
+			"-look_ahead", "0",
+			"-b:v", fmt.Sprintf("%dk", kbps),
+			"-maxrate", fmt.Sprintf("%dk", maxKbps),
+			"-bufsize", fmt.Sprintf("%dk", bufKbps),
+			"-pix_fmt", "nv12",
+			// One-second GOP: recovery never needs the encoder to be torn down and
+			// rebuilt just to get an IDR, which is what MiniRTC-style designs avoid.
+			"-g", fmt.Sprintf("%d", fps),
+		}
+	} else if useFastNvencEncoder("ffmpeg") {
+		videoEncoderName = "h264_nvenc"
 		encoderArgs = []string{
 			"-c:v", "h264_nvenc",
 			// p1 is NVENC's fastest/lowest-quality preset; p3 keeps up with a
@@ -101,9 +136,10 @@ func startVideoEncoder(w, h, fps, quality int) error {
 			"-maxrate", fmt.Sprintf("%dk", maxKbps),
 			"-bufsize", fmt.Sprintf("%dk", bufKbps),
 			"-pix_fmt", "yuv420p",
-			"-g", fmt.Sprintf("%d", fps*2),
+			"-g", fmt.Sprintf("%d", fps),
 		}
 	} else {
+		videoEncoderName = "libx264"
 		encoderArgs = []string{
 			"-c:v", "libx264",
 			// ultrafast drops CABAC and most motion search; veryfast keeps both
@@ -115,7 +151,7 @@ func startVideoEncoder(w, h, fps, quality int) error {
 			"-maxrate", fmt.Sprintf("%dk", maxKbps),
 			"-bufsize", fmt.Sprintf("%dk", bufKbps),
 			"-pix_fmt", "yuv420p",
-			"-g", fmt.Sprintf("%d", fps*2),
+			"-g", fmt.Sprintf("%d", fps),
 			// Keep x264's sliced-threads (from -tune zerolatency): it is what keeps
 			// latency low. The AU splitter groups slices by first_mb_in_slice instead
 			// of assuming one slice per picture.
