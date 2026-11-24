@@ -1,4 +1,5 @@
 import { audio } from '@kit.AudioKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const IMA_INDEX_TABLE: number[] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 const IMA_STEP_TABLE: number[] = [
@@ -86,6 +87,17 @@ export class HarmonyAudioPlayer {
   private playing: boolean = false;
   private static readonly CUSHION_MS = 120;
   private static readonly MAX_LATENCY_MS = 600;
+  // Diagnostics (hilog tag RemoteDeckAudio): underruns are the only way to tell
+  // a network-supply problem from a renderer problem on a real device.
+  private cbCount: number = 0;
+  private cbBytes: number = 0;
+  private underrunBytes: number = 0;
+  private emptyCallbacks: number = 0;
+  private emptySince: number = 0;
+  private pushCount: number = 0;
+  private droppedBytes: number = 0;
+  private lastStatsAt: number = 0;
+  private statsTimer: number = -1;
 
   async start(sampleRate: number = 48000, channels: number = 2): Promise<boolean> {
     this.enabled = true;
@@ -150,9 +162,23 @@ export class HarmonyAudioPlayer {
             this.readOffset = 0;
           }
         }
-        if (this.queuedBytes === 0) {
-          // Let it re-buffer rather than clicking on every empty callback.
-          this.playing = false;
+        this.cbCount += 1;
+        this.cbBytes += written;
+        if (written < dst.byteLength) {
+          this.underrunBytes += dst.byteLength - written;
+          this.emptyCallbacks += 1;
+          // Keep playing through short gaps: stopping and re-cushioning on every
+          // drain is itself audible as a periodic hiccup. Only re-arm the cushion
+          // after a real outage.
+          if (this.queuedBytes === 0) {
+            if (!this.emptySince) this.emptySince = Date.now();
+            else if (Date.now() - this.emptySince > 800) {
+              this.playing = false;
+              this.emptySince = 0;
+            }
+          }
+        } else {
+          this.emptySince = 0;
         }
         return audio.AudioDataCallbackResult.VALID;
       });
@@ -181,6 +207,7 @@ export class HarmonyAudioPlayer {
     const copy = pcm.slice();
     this.queue.push(copy);
     this.queuedBytes += copy.byteLength;
+    this.pushCount += 1;
     // Bound latency, not the cushion: a 100 ms cap (the old value) is smaller
     // than one network burst of 40 ms PCM chunks, so it kept dropping the oldest
     // audio and the stream never filled — audibly choppy.
@@ -189,9 +216,31 @@ export class HarmonyAudioPlayer {
       const dropped = this.queue.shift();
       if (dropped) {
         this.queuedBytes -= dropped.byteLength;
+        this.droppedBytes += dropped.byteLength;
       }
       this.readOffset = 0;
       this.playing = true; // still behind: keep playing the newer audio
+    }
+    const now = Date.now();
+    if (this.lastStatsAt === 0) this.lastStatsAt = now;
+    if (now - this.lastStatsAt >= 2000) {
+      const secs = (now - this.lastStatsAt) / 1000;
+      hilog.info(0x0000, 'RemoteDeckAudio',
+        'rate=%{public}d ch=%{public}d pushed=%{public}d cb=%{public}d playedKBps=%{public}d queuedMs=%{public}d underrun=%{public}d emptyCb=%{public}d dropped=%{public}d playing=%{public}s',
+        normRate, normCh,
+        Math.round(this.pushCount / secs),
+        Math.round(this.cbCount / secs),
+        Math.round((this.cbBytes - this.underrunBytes) / secs / 1024),
+        Math.round(this.queuedBytes / ((normRate * normCh * 2) / 1000)),
+        this.underrunBytes, this.emptyCallbacks, this.droppedBytes,
+        this.playing ? 'yes' : 'no');
+      this.lastStatsAt = now;
+      this.pushCount = 0;
+      this.cbCount = 0;
+      this.cbBytes = 0;
+      this.underrunBytes = 0;
+      this.emptyCallbacks = 0;
+      this.droppedBytes = 0;
     }
   }
 
