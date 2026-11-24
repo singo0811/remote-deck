@@ -1826,6 +1826,11 @@ export class HostAgent {
           if (typeof msg.allowDirty === 'boolean') streamConfig.allowDirty = msg.allowDirty;
           if (typeof msg.codec === 'string') applyCodec(msg.codec);
           streamConfig.hiRes = Boolean(msg.hiRes);
+          // A previous session may have left a zoomed ROI behind. Keeping it
+          // meant the next client only received that sub-rectangle at the preset
+          // scale — it looked blurry no matter which quality was chosen, and cost
+          // far more bandwidth than the preset implied.
+          streamConfig.roi = null;
           streamConfig.maxWidth = Number.isFinite(msg.maxWidth) ? Math.max(0, Math.min(3840, Math.round(msg.maxWidth))) : 0;
           streamConfig.singleFrame = Boolean(msg.singleFrame);
           streamConfig.separateCursor = Boolean(msg.separateCursor);

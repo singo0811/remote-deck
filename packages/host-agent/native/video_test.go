@@ -34,7 +34,7 @@ func TestVideoEncoderProducesDecodableStream(t *testing.T) {
 	}
 
 	const w, h, fps, frames = 160, 120, 15, 10
-	if err := startVideoEncoder(w, h, fps); err != nil {
+	if err := startVideoEncoder(w, h, fps, 80); err != nil {
 		t.Fatalf("startVideoEncoder: %v", err)
 	}
 	defer stopVideoEncoder()
@@ -120,7 +120,7 @@ func TestEncoderEmitsOneAccessUnitPerFrame(t *testing.T) {
 	}
 	defer func() { videoEmit = old }()
 
-	if err := startVideoEncoder(w, h, 10); err != nil {
+	if err := startVideoEncoder(w, h, 10, 80); err != nil {
 		t.Fatalf("startVideoEncoder: %v", err)
 	}
 	defer stopVideoEncoder()
@@ -177,3 +177,33 @@ func TestAnnexBSplitterGroupsAccessUnits(t *testing.T) {
 
 var _ = binary.BigEndian
 
+
+// The encoder budget used to be one hardcoded value for every preset, which made
+// 超清 look soft and 流畅 still saturate a WAN link.
+func TestEncoderTargetKbpsScalesWithQualityAndPixels(t *testing.T) {
+	low := encoderTargetKbps(1720, 720, 24, 62)
+	mid := encoderTargetKbps(3026, 1266, 30, 84)
+	high := encoderTargetKbps(3440, 1440, 24, 92)
+	if !(low < mid && mid < high) {
+		t.Fatalf("bitrate must grow with preset: low=%d mid=%d high=%d", low, mid, high)
+	}
+	if low < 800 || low > 8000 {
+		t.Fatalf("low preset bitrate out of range: %d kbps", low)
+	}
+	if high < 8000 || high > 40000 {
+		t.Fatalf("high preset bitrate out of range: %d kbps", high)
+	}
+	// Same preset on a smaller display must not ask for the same bits.
+	if encoderTargetKbps(1720, 720, 24, 92) >= encoderTargetKbps(3440, 1440, 24, 92) {
+		t.Fatal("bitrate must scale with pixel count")
+	}
+}
+
+func TestEncoderCrfMovesWithQuality(t *testing.T) {
+	if !(encoderCrf(92) < encoderCrf(74) && encoderCrf(74) < encoderCrf(50)) {
+		t.Fatalf("crf must shrink as quality grows: %d %d %d", encoderCrf(92), encoderCrf(74), encoderCrf(50))
+	}
+	if encoderCrf(30) != 32 || encoderCrf(95) != 16 {
+		t.Fatalf("crf endpoints wrong: %d %d", encoderCrf(30), encoderCrf(95))
+	}
+}

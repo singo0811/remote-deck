@@ -175,11 +175,11 @@ func ffmpegSupportsPipewire() bool {
 	return strings.Contains(strings.ToLower(string(out)), "pipewire")
 }
 
-func startVideoEncoder(w, h, fps int) error {
+func startVideoEncoder(w, h, fps, quality int) error {
 	videoMu.Lock()
 	defer videoMu.Unlock()
 	if videoRunning.Load() {
-		if videoW == w && videoH == h && videoFPS == fps {
+		if videoW == w && videoH == h && videoFPS == fps && videoKbps == encoderTargetKbps(w, h, fps, quality) {
 			return nil
 		}
 		stopVideoEncoderLocked()

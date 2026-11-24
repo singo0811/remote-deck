@@ -59,11 +59,11 @@ func useFastNvencEncoder(ffmpeg string) bool {
 	return nvencFastOK
 }
 
-func startVideoEncoder(w, h, fps int) error {
+func startVideoEncoder(w, h, fps, quality int) error {
 	videoMu.Lock()
 	defer videoMu.Unlock()
 	if videoRunning.Load() {
-		if videoW == w && videoH == h && videoFPS == fps {
+		if videoW == w && videoH == h && videoFPS == fps && videoKbps == encoderTargetKbps(w, h, fps, quality) {
 			return nil
 		}
 		stopVideoEncoderLocked()
@@ -78,30 +78,42 @@ func startVideoEncoder(w, h, fps int) error {
 		return fmt.Errorf("ffmpeg not found in PATH")
 	}
 
+	kbps := encoderTargetKbps(w, h, fps, quality)
+	crf := encoderCrf(quality)
+	// A VBV buffer of 1.6 Mbit (the old value) is smaller than one keyframe at
+	// this resolution, so the rate controller kept clamping quality down.
+	maxKbps := kbps + kbps/2
+	bufKbps := maxKbps * 2
+
 	var encoderArgs []string
 	if useFastNvencEncoder("ffmpeg") {
 		encoderArgs = []string{
 			"-c:v", "h264_nvenc",
-			"-preset", "p1",
+			// p1 is NVENC's fastest/lowest-quality preset; p3 keeps up with a
+			// 24-30 fps desktop while compressing noticeably better.
+			"-preset", "p3",
 			"-tune", "ull",
 			"-zerolatency", "1",
-			"-profile:v", "baseline",
-			"-rc", "cbr",
-			"-b:v", "6000k",
-			"-maxrate", "8000k",
-			"-bufsize", "1600k",
+			"-profile:v", "main",
+			"-rc", "vbr",
+			"-cq", fmt.Sprintf("%d", crf),
+			"-b:v", fmt.Sprintf("%dk", kbps),
+			"-maxrate", fmt.Sprintf("%dk", maxKbps),
+			"-bufsize", fmt.Sprintf("%dk", bufKbps),
 			"-pix_fmt", "yuv420p",
 			"-g", fmt.Sprintf("%d", fps*2),
 		}
 	} else {
 		encoderArgs = []string{
 			"-c:v", "libx264",
-			"-preset", "ultrafast",
+			// ultrafast drops CABAC and most motion search; veryfast keeps both
+			// and is the difference between a soft and a crisp desktop.
+			"-preset", "veryfast",
 			"-tune", "zerolatency",
-			"-profile:v", "baseline",
-			"-crf", "23",
-			"-maxrate", "8000k",
-			"-bufsize", "1600k",
+			"-profile:v", "main",
+			"-crf", fmt.Sprintf("%d", crf),
+			"-maxrate", fmt.Sprintf("%dk", maxKbps),
+			"-bufsize", fmt.Sprintf("%dk", bufKbps),
 			"-pix_fmt", "yuv420p",
 			"-g", fmt.Sprintf("%d", fps*2),
 			// Keep x264's sliced-threads (from -tune zerolatency): it is what keeps

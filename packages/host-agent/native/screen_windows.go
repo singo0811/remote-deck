@@ -476,7 +476,7 @@ func captureDisplay(req captureReq) (map[string]any, []byte, error) {
 		}
 		prevVideoRoiKey = roiKey
 		setVideoRoiMeta(roiMeta)
-		if err := startVideoEncoderIfNeeded(vidW, vidH, req.FPS); err != nil {
+		if err := startVideoEncoderIfNeeded(vidW, vidH, req.FPS, req.Quality); err != nil {
 			return nil, nil, err
 		}
 		if err := feedVideoFrame(vidBuf, vidW, vidH); err != nil {

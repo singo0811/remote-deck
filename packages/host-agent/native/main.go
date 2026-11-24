@@ -293,12 +293,13 @@ func main() {
 
 		case cmdVideoStart:
 			var req struct {
-				Width  int `json:"width"`
-				Height int `json:"height"`
-				FPS    int `json:"fps"`
+				Width   int `json:"width"`
+				Height  int `json:"height"`
+				FPS     int `json:"fps"`
+				Quality int `json:"quality"`
 			}
 			if err := json.Unmarshal(payload, &req); err == nil {
-				if err := startVideoEncoderIfNeeded(req.Width, req.Height, req.FPS); err != nil {
+				if err := startVideoEncoderIfNeeded(req.Width, req.Height, req.FPS, req.Quality); err != nil {
 					writeJSONFrame(evtJSON, map[string]any{"op": "video_error", "error": err.Error()})
 				}
 			}

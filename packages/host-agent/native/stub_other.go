@@ -169,7 +169,7 @@ func captureDisplay(req captureReq) (map[string]any, []byte, error) {
 		if needRestart {
 			stopVideoEncoder()
 		}
-		if err := startVideoEncoderIfNeeded(vidW, vidH, req.FPS); err == nil {
+		if err := startVideoEncoderIfNeeded(vidW, vidH, req.FPS, req.Quality); err == nil {
 			return map[string]any{
 				"reqId":        req.ReqID,
 				"displayId":    disp.ID,

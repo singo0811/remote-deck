@@ -31,6 +31,7 @@ var (
 	videoW       int
 	videoH       int
 	videoFPS     int
+	videoKbps    int
 	videoSeq     uint64
 	videoStderr  boundedBuffer
 )
@@ -130,14 +131,56 @@ func startFfmpegVideoCmd(args []string, withStdin bool, w, h, fps int) error {
 	return nil
 }
 
-func startVideoEncoderIfNeeded(w, h, fps int) error {
+// encoderTargetKbps derives a bitrate from the requested quality and pixel rate.
+// One hardcoded bitrate for every preset was why "超清" looked soft on a large
+// display and why "流畅" still saturated a WAN link: the resolution changed but
+// the encoder's budget never did.
+func encoderTargetKbps(w, h, fps, quality int) int {
+	if w <= 0 || h <= 0 || fps <= 0 {
+		return 4000
+	}
+	if quality < 30 {
+		quality = 30
+	}
+	if quality > 95 {
+		quality = 95
+	}
+	// bits per pixel per frame: ~0.055 (thin) .. ~0.20 (generous)
+	bpp := 0.055 + float64(quality-30)/65.0*0.145
+	kbps := float64(w) * float64(h) * float64(fps) * bpp / 1000.0
+	if kbps < 1500 {
+		kbps = 1500
+	}
+	if kbps > 40000 {
+		kbps = 40000
+	}
+	return int(kbps)
+}
+
+// encoderCrf maps the UI quality (30..95) onto an x264/NVENC quality level
+// (32..16): higher UI quality -> lower CRF/CQ -> sharper picture.
+func encoderCrf(quality int) int {
+	if quality < 30 {
+		quality = 30
+	}
+	if quality > 95 {
+		quality = 95
+	}
+	return 32 - int(float64(quality-30)/65.0*16.0)
+}
+
+func startVideoEncoderIfNeeded(w, h, fps, quality int) error {
 	videoMu.Lock()
-	need := !videoRunning.Load() || videoW != w || videoH != h
+	target := encoderTargetKbps(w, h, fps, quality)
+	need := !videoRunning.Load() || videoW != w || videoH != h || videoKbps != target
+	if need {
+		videoKbps = target
+	}
 	videoMu.Unlock()
 	if !need {
 		return nil
 	}
-	return startVideoEncoder(w, h, fps)
+	return startVideoEncoder(w, h, fps, quality)
 }
 
 func stopVideoEncoderLocked() {
