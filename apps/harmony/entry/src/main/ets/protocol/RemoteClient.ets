@@ -1186,7 +1186,14 @@ export class RemoteClient {
   private opusHeadAb: ArrayBuffer | undefined = undefined;
 
   startAudio(): void {
-    const opusOk = TsnetClient.opusInit(48000, 2);
+    // Advertise Opus only on high-latency links. The Opus path decodes one frame
+    // at a time with up to two 15 ms waits inside a serialized call, which cannot
+    // keep up with a 20 ms frame stream and shows up as stuttering. On LAN /
+    // tailnet the host sends lossless pcm16 instead, which costs no decode at all.
+    // A Cloudflare tunnel is still an internet hop, so only the true low-latency
+    // channels skip Opus.
+    const lowLatency = this.channelKind === 'lan' || this.channelKind === 'tailscale';
+    const opusOk = lowLatency ? false : TsnetClient.opusInit(48000, 2);
     const msg: OutMsgAudioStart = {
       type: MsgType.AUDIO_START,
       codec: opusOk ? 'opus' : 'ima_adpcm',

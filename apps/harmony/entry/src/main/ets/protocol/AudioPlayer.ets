@@ -79,6 +79,13 @@ export class HarmonyAudioPlayer {
   private queue: Uint8Array[] = [];
   private queuedBytes: number = 0;
   private readOffset: number = 0;
+  // Small jitter buffer: audio packets arrive in bursts over the same socket as
+  // video, so playing the instant a packet lands underruns constantly and sounds
+  // choppy. Wait for a cushion before starting, and re-buffer instead of
+  // underrunning when it drains.
+  private playing: boolean = false;
+  private static readonly CUSHION_MS = 120;
+  private static readonly MAX_LATENCY_MS = 600;
 
   async start(sampleRate: number = 48000, channels: number = 2): Promise<boolean> {
     this.enabled = true;
@@ -122,6 +129,13 @@ export class HarmonyAudioPlayer {
       r.on('writeData', (buffer: ArrayBuffer): audio.AudioDataCallbackResult => {
         const dst = new Uint8Array(buffer);
         dst.fill(0);
+        const bytesPerMs = (this.activeRate * this.activeChannels * 2) / 1000;
+        if (!this.playing) {
+          if (this.queuedBytes < bytesPerMs * HarmonyAudioPlayer.CUSHION_MS) {
+            return audio.AudioDataCallbackResult.VALID; // still filling the cushion
+          }
+          this.playing = true;
+        }
         let written = 0;
         while (written < dst.byteLength && this.queue.length > 0) {
           const head = this.queue[0];
@@ -135,6 +149,10 @@ export class HarmonyAudioPlayer {
             this.queue.shift();
             this.readOffset = 0;
           }
+        }
+        if (this.queuedBytes === 0) {
+          // Let it re-buffer rather than clicking on every empty callback.
+          this.playing = false;
         }
         return audio.AudioDataCallbackResult.VALID;
       });
@@ -163,19 +181,23 @@ export class HarmonyAudioPlayer {
     const copy = pcm.slice();
     this.queue.push(copy);
     this.queuedBytes += copy.byteLength;
-    // Cap jitter buffer to ~100ms to keep audio tight with 60fps H.264 video
-    const maxBytes = normRate * normCh * 2 / 10;
+    // Bound latency, not the cushion: a 100 ms cap (the old value) is smaller
+    // than one network burst of 40 ms PCM chunks, so it kept dropping the oldest
+    // audio and the stream never filled — audibly choppy.
+    const maxBytes = (normRate * normCh * 2 * HarmonyAudioPlayer.MAX_LATENCY_MS) / 1000;
     while (this.queuedBytes > maxBytes && this.queue.length > 1) {
       const dropped = this.queue.shift();
       if (dropped) {
-        this.queuedBytes -= (dropped.byteLength - this.readOffset);
+        this.queuedBytes -= dropped.byteLength;
       }
       this.readOffset = 0;
+      this.playing = true; // still behind: keep playing the newer audio
     }
   }
 
   async stop(): Promise<void> {
     this.enabled = false;
+    this.playing = false;
     this.queue = [];
     this.queuedBytes = 0;
     this.readOffset = 0;
@@ -189,6 +211,7 @@ export class HarmonyAudioPlayer {
   }
 
   async releaseRenderer(): Promise<void> {
+    this.playing = false;
     this.queue = [];
     this.queuedBytes = 0;
     this.readOffset = 0;
