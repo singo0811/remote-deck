@@ -134,6 +134,104 @@ class WorkerCaptureBridge {
 }
 
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024; // 4 MiB backpressure limit
+
+/**
+ * How much video we are willing to have queued in the socket before dropping
+ * frames. This is a *latency* budget, not a bandwidth one: 4 MiB at 8 Mbps is
+ * four seconds of stale picture, which is exactly what "外网太卡" feels like.
+ * Kept small so a slow link shows a lower frame rate instead of an ever-growing
+ * delay.
+ */
+const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
+// Set when a frame was skipped for latency; the next capture then emits a keyframe
+// so the client resynchronises instead of showing a broken picture.
+let frameDroppedForLatency = false;
+
+/** Channel classes: how much we trust a transport path for realtime video. */
+function channelProfile(channel) {
+  switch (channel) {
+    case 'relay':
+      return { qualityFactor: 0.55, maxWidthCap: 1600, fpsCap: 24 };
+    case 'tunnel':
+      return { qualityFactor: 0.5, maxWidthCap: 1440, fpsCap: 22 };
+    case 'tailscale':
+      return { qualityFactor: 0.9, maxWidthCap: 0, fpsCap: 0 };
+    case 'webrtc':
+      return { qualityFactor: 1, maxWidthCap: 0, fpsCap: 0 };
+    default:
+      return { qualityFactor: 1, maxWidthCap: 0, fpsCap: 0 };
+  }
+}
+
+/** The least capable channel among the clients watching the stream. */
+function worstChannel(channels) {
+  const rank = { lan: 0, webrtc: 0, tailscale: 1, relay: 2, tunnel: 3 };
+  let worst = 'lan';
+  for (const ch of channels) {
+    if ((rank[ch] ?? 0) > (rank[worst] ?? 0)) worst = ch;
+  }
+  return worst;
+}
+
+/**
+ * Resolve the stream parameters actually used for capture, from the client's
+ * requested preset, the current ABR level and the transport in use.
+ *
+ * Consumes latency, not just bandwidth: on a relay/tunnel path the bitrate is
+ * scaled back (which our encoder maps to CRF/bitrate) and the resolution/fps are
+ * capped, so a WAN client gets a steady low-latency picture instead of a sharp
+ * one that keeps stalling.
+ */
+export function effectiveStreamParams(streamConfig, { abrLevel = 0, channel = 'lan' } = {}) {
+  const tiers = streamConfig.codec === 'h264'
+    ? [
+        { fps: 30, scale: 1.0, quality: 84, maxWidth: 2240 },
+        { fps: 26, scale: 0.85, quality: 78, maxWidth: 1920 },
+        { fps: 20, scale: 0.72, quality: 70, maxWidth: 1440 },
+        { fps: 14, scale: 0.55, quality: 62, maxWidth: 1280 },
+      ]
+    : [
+        { fps: 30, scale: 0.85, quality: 80, maxWidth: 1920 },
+        { fps: 24, scale: 0.75, quality: 74, maxWidth: 1600 },
+        { fps: 18, scale: 0.62, quality: 66, maxWidth: 1280 },
+        { fps: 12, scale: 0.48, quality: 58, maxWidth: 1024 },
+      ];
+  const clientMaxW = streamConfig.maxWidth > 0 ? streamConfig.maxWidth : 0;
+  const level = Math.max(0, Math.min(3, abrLevel));
+  const base = streamConfig.auto
+    ? tiers[level]
+    : { fps: streamConfig.fps, scale: streamConfig.scale, quality: streamConfig.quality, maxWidth: clientMaxW };
+
+  if (streamConfig.hiRes) {
+    // Client is zoomed in: full resolution beats bandwidth savings.
+    return { fps: Math.min(24, base.fps), scale: 1.0, quality: Math.max(92, base.quality), maxWidth: 0 };
+  }
+
+  const profile = channelProfile(channel);
+  let maxWidth = clientMaxW > 0 && base.maxWidth > 0
+    ? Math.min(clientMaxW, base.maxWidth)
+    : (clientMaxW || base.maxWidth || 0);
+  let fps = base.fps;
+  let quality = base.quality;
+
+  // Congestion lowers the bitrate even when the user pinned a preset: keeping
+  // the resolution but spending fewer bits degrades gracefully instead of
+  // stalling. The encoder turns `quality` into crf + bitrate.
+  if (!streamConfig.auto && level > 0) {
+    quality -= [0, 10, 20, 30][level];
+  }
+  quality = Math.round(quality * profile.qualityFactor);
+  if (profile.maxWidthCap > 0 && (maxWidth === 0 || maxWidth > profile.maxWidthCap)) {
+    maxWidth = profile.maxWidthCap;
+    // A width cap must not be wider than what the preset asked for either.
+    if (clientMaxW > 0) maxWidth = Math.min(maxWidth, clientMaxW);
+  }
+  if (profile.fpsCap > 0) fps = Math.min(fps, profile.fpsCap);
+
+  quality = Math.max(30, Math.min(95, Math.round(quality)));
+  return { fps, scale: base.scale, quality, maxWidth };
+}
+
 // Dirty-rect patches cannot self-heal, so periodically resend a full frame.
 // Rare on purpose: a full frame costs several normal frames' time (visible hitch).
 const FULL_FRAME_REFRESH_FRAMES = 240;
@@ -349,9 +447,15 @@ export class HostAgent {
       if (this.videoSessions.size === 0 || !data || data.length === 0) return;
       const envelope = encodeBinaryEnvelope(FRAME_KIND.VIDEO, meta || {}, data);
       for (const sess of this.videoSessions) {
-        if (sess.transport.isOpen() && sess.transport.getBufferedAmount() < MAX_BUFFERED_BYTES) {
-          sess.transport.sendBinary(envelope);
+        if (!sess.transport.isOpen()) continue;
+        const queued = sess.transport.getBufferedAmount();
+        // Drop when the queue would add visible delay. Requesting a keyframe on
+        // the way out keeps the picture recoverable instead of frozen.
+        if (queued > VIDEO_LATENCY_BUDGET_BYTES && !meta?.key) {
+          frameDroppedForLatency = true;
+          continue;
         }
+        sess.transport.sendBinary(envelope);
       }
     });
 
@@ -1505,31 +1609,10 @@ export class HostAgent {
     };
 
     const getEffectiveStreamParams = () => {
-      const clientMaxW = streamConfig.maxWidth > 0 ? streamConfig.maxWidth : 0;
-      const tiers = streamConfig.codec === 'h264'
-        ? [
-            { fps: 30, scale: 1.0, quality: 84, maxWidth: 2240 },
-            { fps: 26, scale: 0.85, quality: 78, maxWidth: 1920 },
-            { fps: 20, scale: 0.72, quality: 70, maxWidth: 1440 },
-            { fps: 14, scale: 0.55, quality: 62, maxWidth: 1280 },
-          ]
-        : [
-            { fps: 30, scale: 0.85, quality: 80, maxWidth: 1920 },
-            { fps: 24, scale: 0.75, quality: 74, maxWidth: 1600 },
-            { fps: 18, scale: 0.62, quality: 66, maxWidth: 1280 },
-            { fps: 12, scale: 0.48, quality: 58, maxWidth: 1024 },
-          ];
-      const base = streamConfig.auto
-        ? tiers[Math.max(0, Math.min(3, abrLevel))]
-        : { fps: streamConfig.fps, scale: streamConfig.scale, quality: streamConfig.quality, maxWidth: clientMaxW };
-      if (streamConfig.hiRes) {
-        // Client is zoomed in: full resolution beats bandwidth savings.
-        return { fps: Math.min(24, base.fps), scale: 1.0, quality: Math.max(92, base.quality), maxWidth: 0 };
-      }
-      const effMaxW = clientMaxW > 0 && base.maxWidth > 0
-        ? Math.min(clientMaxW, base.maxWidth)
-        : (clientMaxW || base.maxWidth || 0);
-      return { fps: base.fps, scale: base.scale, quality: base.quality, maxWidth: effMaxW };
+      const channels = [];
+      for (const sess of this.videoSessions) channels.push(sess.transport?.channelName || 'lan');
+      if (channels.length === 0) channels.push(streamConfig.channelHint || 'lan');
+      return effectiveStreamParams(streamConfig, { abrLevel, channel: worstChannel(channels) });
     };
 
     // Absolute-deadline pacing: the deadline advances by exactly one interval and
@@ -1670,8 +1753,9 @@ export class HostAgent {
         const eff = getEffectiveStreamParams();
         const captureScale = eff.scale;
         const capStart = Date.now();
-        const sendForceKey = forceKeyPending;
+        const sendForceKey = forceKeyPending || frameDroppedForLatency;
         forceKeyPending = false;
+        frameDroppedForLatency = false;
         const { meta, jpeg } = await this.captureBridge.captureFrame({
           displayId: streamConfig.displayId,
           scale: captureScale,
@@ -2219,7 +2303,7 @@ export class HostAgent {
                   ));
                   return;
                 }
-                if (transport.getBufferedAmount() > MAX_BUFFERED_BYTES && !pkt.key && !pkt.codecData) return;
+                if (transport.getBufferedAmount() > VIDEO_LATENCY_BUDGET_BYTES && !pkt.key && !pkt.codecData) return;
                 transport.sendBinary(encodeBinaryEnvelope(
                   FRAME_KIND.PHONE_VIDEO,
                   { width: pkt.width, height: pkt.height, key: Boolean(pkt.key), codecData: Boolean(pkt.codecData), ts: pkt.ptsUs },
