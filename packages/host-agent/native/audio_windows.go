@@ -50,12 +50,9 @@ type waveFormatEx struct {
 	CbSize          uint16
 }
 
-type waveFormatExtensible struct {
-	Format      waveFormatEx
-	Samples     uint16
-	ChannelMask uint32
-	SubFormat   guid
-}
+// waveFormatExtensible is intentionally not modelled as a Go struct: the packed
+// Windows layout (base format is 18 bytes) does not match Go's padded struct
+// layout, so callers read SubFormat from the raw pointer at offset 24 instead.
 
 func comMethod(obj uintptr, index uintptr) uintptr {
 	vtbl := *(*uintptr)(unsafe.Pointer(obj))
@@ -156,6 +153,48 @@ func stopAudioCapture() {
 	}
 }
 
+// convertAudioToPCM16S16 converts one WASAPI capture buffer into interleaved
+// 16-bit PCM for `outCh` channels. It returns the PCM and whether any sample was
+// loud enough to be worth streaming (the loopback mix is silent most of the
+// time, and sending silence would waste bandwidth).
+func convertAudioToPCM16S16(raw []byte, numFrames int, wfx waveFormatEx, isFloat bool, outCh int) ([]byte, bool) {
+	bytesPerSample := int(wfx.WBitsPerSample) / 8
+	out := make([]byte, numFrames*outCh*2)
+	nonZero := false
+	for f := 0; f < numFrames; f++ {
+		for ch := 0; ch < outCh; ch++ {
+			srcIdx := f*int(wfx.NBlockAlign) + ch*bytesPerSample
+			var s16 int16
+			if isFloat && bytesPerSample == 4 && srcIdx+4 <= len(raw) {
+				bits := binary.LittleEndian.Uint32(raw[srcIdx : srcIdx+4])
+				fv := math.Float32frombits(bits)
+				if fv > 1 {
+					fv = 1
+				} else if fv < -1 {
+					fv = -1
+				}
+				s16 = int16(fv * 32767)
+			} else if !isFloat && bytesPerSample == 4 && srcIdx+4 <= len(raw) {
+				s16 = int16(int32(binary.LittleEndian.Uint32(raw[srcIdx:srcIdx+4])) >> 16)
+			} else if !isFloat && bytesPerSample == 3 && srcIdx+3 <= len(raw) {
+				v := int32(raw[srcIdx]) | int32(raw[srcIdx+1])<<8 | int32(raw[srcIdx+2])<<16
+				if v&0x800000 != 0 {
+					v |= ^int32(0xFFFFFF)
+				}
+				s16 = int16(v >> 8)
+			} else if !isFloat && bytesPerSample == 2 && srcIdx+2 <= len(raw) {
+				s16 = int16(binary.LittleEndian.Uint16(raw[srcIdx : srcIdx+2]))
+			}
+			if s16 > 4 || s16 < -4 {
+				nonZero = true
+			}
+			di := (f*outCh + ch) * 2
+			binary.LittleEndian.PutUint16(out[di:di+2], uint16(s16))
+		}
+	}
+	return out, nonZero
+}
+
 func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -209,11 +248,20 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 
 	wfx := *(*waveFormatEx)(unsafe.Pointer(pwfx))
 	isFloat := wfx.WFormatTag == 3
+	subFormatID := uint32(0)
 	if wfx.WFormatTag == 0xFFFE && wfx.CbSize >= 22 {
-		ext := *(*waveFormatExtensible)(unsafe.Pointer(pwfx))
-		if ext.SubFormat == subtypeIEEEFloat {
+		// WAVEFORMATEXTENSIBLE is packed on the wire: the base WAVEFORMATEX is 18
+		// bytes, then wSamplesPerBlock(2) and dwChannelMask(4), so the SubFormat
+		// GUID starts at byte 24. Go pads the inner waveFormatEx struct to 20
+		// bytes, so reading SubFormat through a struct lands 4 bytes late and
+		// reports PCM for an IEEE-float device — which turned every float sample
+		// into full-scale integer noise. Read it at the real offset instead.
+		raw := unsafe.Slice((*byte)(unsafe.Pointer(pwfx)), 40)
+		sub := *(*guid)(unsafe.Pointer(&raw[24]))
+		subFormatID = sub.Data1
+		if sub == subtypeIEEEFloat {
 			isFloat = true
-		} else if ext.SubFormat == subtypePCM {
+		} else if sub == subtypePCM {
 			isFloat = false
 		}
 	}
@@ -253,12 +301,15 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 	// Report the negotiated format once: without this, "no sound" is impossible to
 	// diagnose because silent loopback buffers are filtered out below.
 	writeJSONFrame(evtJSON, map[string]any{
-		"op":          "audio_info",
-		"sampleRate":  int(wfx.NSamplesPerSec),
-		"channels":    int(wfx.NChannels),
-		"bitsPerSmpl": int(wfx.WBitsPerSample),
-		"blockAlign":  int(wfx.NBlockAlign),
-		"float":       isFloat,
+		"op":           "audio_info",
+		"sampleRate":   int(wfx.NSamplesPerSec),
+		"channels":     int(wfx.NChannels),
+		"bitsPerSmpl":  int(wfx.WBitsPerSample),
+		"blockAlign":   int(wfx.NBlockAlign),
+		"float":        isFloat,
+		"formatTag":    int(wfx.WFormatTag),
+		"cbSize":       int(wfx.CbSize),
+		"subFormat":    fmt.Sprintf("0x%08x", subFormatID),
 		"lowBandwidth": audioLowBandwidth.Load(),
 	})
 
@@ -417,46 +468,7 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 				if numFrames > 0 && dataPtr != 0 && (flags&0x2) == 0 { // not AUDCLNT_BUFFERFLAGS_SILENT
 					byteCount := int(numFrames) * int(wfx.NBlockAlign)
 					raw := unsafe.Slice((*byte)(unsafe.Pointer(dataPtr)), byteCount)
-					nonZero := false
-					tmp := make([]byte, int(numFrames)*outCh*2)
-					bytesPerSample := int(wfx.WBitsPerSample) / 8
-
-					for f := 0; f < int(numFrames); f++ {
-						for ch := 0; ch < outCh; ch++ {
-							srcIdx := f*int(wfx.NBlockAlign) + ch*bytesPerSample
-							var s16 int16
-							if isFloat && bytesPerSample == 4 && srcIdx+4 <= len(raw) {
-								bits := binary.LittleEndian.Uint32(raw[srcIdx : srcIdx+4])
-								fv := math.Float32frombits(bits)
-								if fv > 1 {
-									fv = 1
-								} else if fv < -1 {
-									fv = -1
-								}
-								s16 = int16(fv * 32767)
-							} else if !isFloat && bytesPerSample == 4 && srcIdx+4 <= len(raw) {
-								// 32-bit integer mix format (common for "audio enhancements"
-								// devices): the old code only handled float32/int16 here, so
-								// every sample became 0 and the silence filter dropped the
-								// whole stream — i.e. no audio at all.
-								s16 = int16(int32(binary.LittleEndian.Uint32(raw[srcIdx:srcIdx+4])) >> 16)
-							} else if !isFloat && bytesPerSample == 3 && srcIdx+3 <= len(raw) {
-								v := int32(raw[srcIdx]) | int32(raw[srcIdx+1])<<8 | int32(raw[srcIdx+2])<<16
-								if v&0x800000 != 0 {
-									v |= ^int32(0xFFFFFF)
-								}
-								s16 = int16(v >> 8)
-							} else if !isFloat && bytesPerSample == 2 && srcIdx+2 <= len(raw) {
-								s16 = int16(binary.LittleEndian.Uint16(raw[srcIdx : srcIdx+2]))
-							}
-							if s16 > 4 || s16 < -4 {
-								nonZero = true
-							}
-							di := (f*outCh + ch) * 2
-							binary.LittleEndian.PutUint16(tmp[di:di+2], uint16(s16))
-						}
-					}
-
+					tmp, nonZero := convertAudioToPCM16S16(raw, int(numFrames), wfx, isFloat, outCh)
 					if nonZero {
 						out := tmp
 						if decimate {
