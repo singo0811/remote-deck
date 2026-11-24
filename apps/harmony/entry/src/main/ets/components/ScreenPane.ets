@@ -139,9 +139,9 @@ export struct ScreenPane {
   @State orbMenuOpen: boolean = false;
   @State localCursorX: number = 0.5;
   @State localCursorY: number = 0.5;
-  @State @Watch('onViewTick') zoom: number = 1;
-  @State @Watch('onViewTick') panX: number = 0;
-  @State @Watch('onViewTick') panY: number = 0;
+  @State @Watch('onZoomTick') zoom: number = 1;
+  @State @Watch('onPanTick') panX: number = 0;
+  @State @Watch('onPanTick') panY: number = 0;
   @State rippleVisible: boolean = false;
   @State rippleX: number = 0;
   @State rippleY: number = 0;
@@ -294,9 +294,36 @@ export struct ScreenPane {
     }
   }
 
-  onViewTick(): void {
+  onZoomTick(): void {
+    // Only a real zoom change needs to reach the parent; panning used to run
+    // this too, re-rendering the whole pane (and the video surface) per touch
+    // move, which showed up as jitter while dragging the zoomed view sideways.
     this.onZoomLevel(this.zoom);
     this.scheduleZoomRoiUpdate();
+  }
+
+  onPanTick(): void {
+    this.scheduleZoomRoiUpdate();
+  }
+
+  /** Viewport (what the user can see) expressed in full-desktop normalized coords. */
+  private visibleNormalizedRect(): ImageRect {
+    const tl = this.localToNormalized(0, 0);
+    const br = this.localToNormalized(this.areaWidth, this.areaHeight);
+    return { x: tl.x, y: tl.y, w: Math.max(0.01, br.x - tl.x), h: Math.max(0.01, br.y - tl.y) };
+  }
+
+  /** True when the current ROI still covers the viewport with some slack. */
+  private roiCoversViewport(): boolean {
+    if (!this.roiRequested || this.videoRoiW <= 0.01 || this.videoRoiH <= 0.01) return false;
+    const vis = this.visibleNormalizedRect();
+    const slack = 0.015;
+    return (
+      vis.x >= this.videoRoiX + slack &&
+      vis.y >= this.videoRoiY + slack &&
+      vis.x + vis.w <= this.videoRoiX + this.videoRoiW - slack &&
+      vis.y + vis.h <= this.videoRoiY + this.videoRoiH - slack
+    );
   }
 
   private scheduleZoomRoiUpdate(): void {
@@ -317,22 +344,27 @@ export struct ScreenPane {
     if (this.roiSyncTimer !== -1) {
       clearTimeout(this.roiSyncTimer);
     }
+    // Moving the ROI makes the host emit a fresh keyframe, so only re-cut it when
+    // panning actually leaves the region we already stream (edge-triggered)
+    // instead of once per settle.
+    const settleMs = this.roiRequested ? 320 : 140;
     this.roiSyncTimer = setTimeout(() => {
       this.roiSyncTimer = -1;
       if (this.zoom <= 2.2 || !this.client || this.areaWidth <= 10 || this.areaHeight <= 10) return;
-      const tl = this.localToNormalized(0, 0);
-      const br = this.localToNormalized(this.areaWidth, this.areaHeight);
-      const pad = 0.06;
-      const rx = Math.max(0, Math.min(0.84, Math.round((tl.x - pad) * 50) / 50));
-      const ry = Math.max(0, Math.min(0.84, Math.round((tl.y - pad) * 50) / 50));
-      const rw = Math.max(0.16, Math.min(1 - rx, Math.round((br.x - rx + pad) * 50) / 50));
-      const rh = Math.max(0.16, Math.min(1 - ry, Math.round((br.y - ry + pad) * 50) / 50));
+      if (this.roiCoversViewport()) return;
+      const vis = this.visibleNormalizedRect();
+      const pad = 0.14;
+      const snap = (v: number): number => Math.round(v * 25) / 25;
+      const rx = Math.max(0, Math.min(0.8, snap(vis.x - pad)));
+      const ry = Math.max(0, Math.min(0.8, snap(vis.y - pad)));
+      const rw = Math.max(0.2, Math.min(1 - rx, snap(vis.w + pad * 2)));
+      const rh = Math.max(0.2, Math.min(1 - ry, snap(vis.h + pad * 2)));
       const key = `${rx.toFixed(2)}:${ry.toFixed(2)}:${rw.toFixed(2)}:${rh.toFixed(2)}`;
       if (key === this.lastRoiSentKey) return;
       this.lastRoiSentKey = key;
       this.roiRequested = true;
       this.client.setRoi(rx, ry, rw, rh);
-    }, 220);
+    }, settleMs);
   }
 
   /** Coalesce drag distance into smooth sub-notch wheel deltas. */
