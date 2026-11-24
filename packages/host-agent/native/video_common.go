@@ -32,6 +32,7 @@ var (
 	videoH       int
 	videoFPS     int
 	videoKbps    int
+	videoStarts  atomic.Uint64
 	videoSeq     uint64
 	videoStderr  boundedBuffer
 )
@@ -176,10 +177,25 @@ func startVideoEncoderIfNeeded(w, h, fps, quality int) error {
 	if need {
 		videoKbps = target
 	}
+	prevW, prevH, prevKbps := videoW, videoH, videoKbps
 	videoMu.Unlock()
 	if !need {
 		return nil
 	}
+	// Emit why the encoder restarted: a restart costs a keyframe, so a per-frame
+	// restart looks like a keyframe storm on the wire.
+	writeJSONFrame(evtJSON, map[string]any{
+		"op":    "video_start",
+		"w":     w,
+		"h":     h,
+		"fps":   fps,
+		"kbps":  target,
+		"crf":   encoderCrf(quality),
+		"prevW": prevW,
+		"prevH": prevH,
+		"prevK": prevKbps,
+		"seq":   videoStarts.Add(1),
+	})
 	return startVideoEncoder(w, h, fps, quality)
 }
 

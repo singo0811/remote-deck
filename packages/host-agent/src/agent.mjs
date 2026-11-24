@@ -145,7 +145,6 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024; // 4 MiB backpressure limit
 const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
 // Set when a frame was skipped for latency; the next capture then emits a keyframe
 // so the client resynchronises instead of showing a broken picture.
-let frameDroppedForLatency = false;
 
 /** Channel classes: how much we trust a transport path for realtime video. */
 function channelProfile(channel) {
@@ -451,10 +450,11 @@ export class HostAgent {
         const queued = sess.transport.getBufferedAmount();
         // Drop when the queue would add visible delay. Requesting a keyframe on
         // the way out keeps the picture recoverable instead of frozen.
-        if (queued > VIDEO_LATENCY_BUDGET_BYTES && !meta?.key) {
-          frameDroppedForLatency = true;
-          continue;
-        }
+        // Dropping is preferable to queueing: a long queue is just accumulated
+        // delay. Recovery is left to the periodic IDR and the client's own
+        // full-frame request — forcing a keyframe here makes things worse,
+        // because the keyframe is the largest frame and refills the queue.
+        if (queued > VIDEO_LATENCY_BUDGET_BYTES && !meta?.key) continue;
         sess.transport.sendBinary(envelope);
       }
     });
@@ -1401,6 +1401,13 @@ export class HostAgent {
     let abrStableTicks = 0;
     let abrCongestTicks = 0;
     let forceKeyPending = false;
+let lastRecoveryKeyAt = 0;
+// streamConfig is shared by every viewer, so a second client sending its own preset
+// made the encoder flip parameters every frame — which restarts the encoder and
+// emits a keyframe each time (a 70 Mbps storm that also starved capture). Only one
+// session owns the stream parameters; others still watch the same stream.
+let streamConfigOwner = null;
+let lastForcedKeyAt = 0;
     let h264Congested = false;
     let lastCursorShapeId = 0;
     let lastCursorSentX = -1;
@@ -1455,6 +1462,7 @@ export class HostAgent {
         if (!this.sessions.has(session)) return;
         const wasAuthed = authenticated;
         this.sessions.delete(session);
+        if (streamConfigOwner === session) streamConfigOwner = null;
         this.audioSessions.delete(session);
         this.clipboardWatchers.delete(session);
         this.videoSessions.delete(session);
@@ -1666,6 +1674,16 @@ export class HostAgent {
     };
     const scheduleNextFrame = () => {
       if (!streaming || !transport.isOpen()) return;
+      // Exactly one session may drive capture. Each connection has its own
+      // streamConfig and pacer, so two viewers used to run two capture loops
+      // against one encoder: the dimensions alternated every frame, which
+      // restarted the encoder and emitted a keyframe each time (70+ Mbps, plus
+      // "Screen capture timed out"). A non-owner simply stops capturing and
+      // receives the owner's frames through the shared video fan-out.
+      if (streamConfigOwner !== session) {
+        streaming = false;
+        return;
+      }
       const eff = getEffectiveStreamParams();
       const nominal = Math.max(20, Math.round(1000 / Math.max(1, Math.min(30, eff.fps))));
       // Leave at least ~10ms of sleep so timers stay on schedule instead of
@@ -1694,6 +1712,16 @@ export class HostAgent {
       const wakeAt = Date.now();
       const wakeLag = schedAt ? wakeAt - schedAt - schedDelay : -1;
       if (!streaming || !transport.isOpen()) return;
+      // Exactly one session may drive capture. Each connection has its own
+      // streamConfig and pacer, so two viewers used to run two capture loops
+      // against one encoder: the dimensions alternated every frame, which
+      // restarted the encoder and emitted a keyframe each time (70+ Mbps, plus
+      // "Screen capture timed out"). A non-owner simply stops capturing and
+      // receives the owner's frames through the shared video fan-out.
+      if (streamConfigOwner !== session) {
+        streaming = false;
+        return;
+      }
       if (schedAt) {
         const lag = Date.now() - schedAt - schedDelay;
         timerLagEma = timerLagEma * 0.75 + Math.max(-5, Math.min(40, lag)) * 0.25;
@@ -1712,7 +1740,16 @@ export class HostAgent {
         }
         if (h264Congested && buffered < 131072) {
           h264Congested = false;
-          forceKeyPending = true;
+          // One recovery keyframe, at most once a second. Asking for one every
+          // time the queue drained below the threshold was self-defeating: the
+          // keyframe is the biggest frame, so it immediately refilled the queue,
+          // congested again, and produced another keyframe — a 79 Mbps storm that
+          // also starved the capture backend ("Screen capture timed out").
+          const nowMs = Date.now();
+          if (nowMs - lastRecoveryKeyAt > 1000) {
+            lastRecoveryKeyAt = nowMs;
+            forceKeyPending = true;
+          }
         }
       }
       if (buffered > MAX_BUFFERED_BYTES) {
@@ -1753,9 +1790,8 @@ export class HostAgent {
         const eff = getEffectiveStreamParams();
         const captureScale = eff.scale;
         const capStart = Date.now();
-        const sendForceKey = forceKeyPending || frameDroppedForLatency;
+        const sendForceKey = forceKeyPending;
         forceKeyPending = false;
-        frameDroppedForLatency = false;
         const { meta, jpeg } = await this.captureBridge.captureFrame({
           displayId: streamConfig.displayId,
           scale: captureScale,
@@ -1902,6 +1938,14 @@ export class HostAgent {
         }
         case MSG.SCREEN_START: {
           if (!this.permissions.view) return;
+          if (streamConfigOwner && streamConfigOwner !== session) {
+            // Another viewer owns the stream: do not re-configure it, just let
+            // this client attach to what is already being encoded.
+            this.videoSessions.add(session);
+            session.sendJson({ type: MSG.SCREEN_CONFIG, codec: streamConfig.codec });
+            return;
+          }
+          streamConfigOwner = session;
           if (typeof msg.displayId === 'number') streamConfig.displayId = msg.displayId;
           if (typeof msg.fps === 'number') streamConfig.fps = msg.fps;
           if (typeof msg.scale === 'number') streamConfig.scale = msg.scale;
@@ -1931,6 +1975,8 @@ export class HostAgent {
           return;
         }
         case MSG.SCREEN_CONFIG: {
+          if (streamConfigOwner && streamConfigOwner !== session) return;
+          streamConfigOwner = session;
           if (typeof msg.displayId === 'number') {
             streamConfig.displayId = msg.displayId;
             lastHash = '';
@@ -1965,8 +2011,15 @@ export class HostAgent {
             forceKeyPending = true;
           }
           if (msg.forceKey === true) {
-            forceKeyPending = true;
-            lastHash = '';
+            // A client that keeps asking for keyframes turns the stream into an
+            // all-I-frame one (each keyframe restarts the encoder), which is
+            // slower and much bigger for everyone. Honour at most one per second.
+            const nowMs = Date.now();
+            if (nowMs - lastForcedKeyAt > 1000) {
+              lastForcedKeyAt = nowMs;
+              forceKeyPending = true;
+              lastHash = '';
+            }
           }
           if (typeof msg.hiRes === 'boolean' && msg.hiRes !== streamConfig.hiRes) {
             streamConfig.hiRes = msg.hiRes;
