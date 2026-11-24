@@ -168,13 +168,18 @@ test('E2E LAN direct: auth, real screen JPEG capture, PTY execution, and file CR
     await rpc({ type: MSG.FS_MKDIR, path: subDir });
 
     const transferId = 'up-1';
-    await rpc({
+    const startAck = await rpc({
       type: MSG.FS_UPLOAD_START,
       transferId,
       dirPath: subDir,
       fileName: 'hello.txt',
       total: 18,
     });
+    // The upload handshake must be acknowledged, otherwise the browser waits for
+    // a reply that never comes and stalls five seconds before sending bytes.
+    assert.equal(startAck.op, 'upload_ack');
+    assert.equal(startAck.ok, true);
+    assert.equal(startAck.offset, 0);
     const uploadDonePromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Upload finish timeout')), 5000);
       const onMsg = (data, isBinary) => {
@@ -189,7 +194,8 @@ test('E2E LAN direct: auth, real screen JPEG capture, PTY execution, and file CR
       ws.on('message', onMsg);
     });
     ws.send(encodeBinaryEnvelope(FRAME_KIND.FILE_UP, { transferId, done: true }, Buffer.from('Hello RemoteDeck!\n')));
-    await uploadDonePromise;
+    const doneAck = await uploadDonePromise;
+    assert.equal(doneAck.ok, true);
 
     const readRes = await rpc({ type: MSG.FS_READ_TEXT, path: path.join(subDir, 'hello.txt') });
     assert.equal(readRes.content, 'Hello RemoteDeck!\n');

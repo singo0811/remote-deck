@@ -1377,8 +1377,20 @@ export class HostAgent {
                 await this.files.appendUploadChunk(transferId, env.payload);
               }
               if (done) {
-                const res = await this.files.finishUpload(transferId);
-                session.sendJson({ type: MSG.FS_RESULT, op: 'upload_done', transferId, ...res });
+                // Always answer with a correlated upload_done so the client can
+                // tell success from a remote write failure (disk full, perms).
+                try {
+                  const res = await this.files.finishUpload(transferId);
+                  session.sendJson({ type: MSG.FS_RESULT, op: 'upload_done', transferId, ok: true, ...res });
+                } catch (err) {
+                  session.sendJson({
+                    type: MSG.FS_RESULT,
+                    op: 'upload_done',
+                    transferId,
+                    ok: false,
+                    error: err?.message || 'finish failed',
+                  });
+                }
               }
             }
           } catch (err) {
@@ -2080,7 +2092,18 @@ export class HostAgent {
                 total: msg.total || 0,
                 offset: msg.offset || 0,
               });
-              session.sendJson({ type: MSG.FS_RESULT, reqId: msg.reqId, op: 'upload_start', ...res });
+              // The client correlates on transferId (it sends no reqId here) and
+              // needs the resume offset back, otherwise it stalls waiting for an
+              // ack that never matches and re-sends bytes from 0.
+              session.sendJson({
+                type: MSG.FS_RESULT,
+                reqId: msg.reqId,
+                op: 'upload_ack',
+                transferId: msg.transferId,
+                ok: true,
+                offset: res.offset || 0,
+                path: res.path,
+              });
             } else if (msg.type === MSG.FS_UPLOAD_END) {
               const res = await this.files.finishUpload(msg.transferId);
               session.sendJson({ type: MSG.FS_RESULT, reqId: msg.reqId, op: 'upload_done', transferId: msg.transferId, ...res });

@@ -85,6 +85,19 @@ export class RemoteTransport {
     }
   }
 
+  // Bytes queued in the underlying socket / data channel. File uploads use this
+  // to apply backpressure instead of dumping a whole file into the send buffer
+  // at once (which stalls or kills the tab on large files).
+  bufferedAmount() {
+    const ch = this.activeChannel;
+    if (!ch) return 0;
+    try {
+      return Number(ch.bufferedAmount?.() || 0);
+    } catch {
+      return 0;
+    }
+  }
+
   async connect({ mode, serverUrl, deviceId, pin, fallbackUrl = '' }) {
     this.disconnect(false);
     this.closed = false;
@@ -175,6 +188,7 @@ export class RemoteTransport {
             authInfo: msg,
             sendText: (t) => ws.send(t),
             sendBinary: (u8) => ws.send(u8),
+            bufferedAmount: () => ws.bufferedAmount || 0,
             close: () => ws.close(),
           });
           return;
@@ -333,6 +347,7 @@ export class RemoteTransport {
             authInfo: msg,
             sendText: (t) => ws.send(t),
             sendBinary: (u8) => ws.send(u8),
+            bufferedAmount: () => ws.bufferedAmount || 0,
             close: () => ws.close(),
           });
           settled = true;
@@ -399,6 +414,7 @@ export class RemoteTransport {
             authInfo: msg,
             sendText: (t) => dc.send(t),
             sendBinary: (u8) => dc.send(u8),
+          bufferedAmount: () => dc.bufferedAmount || 0,
             close: () => dc.close(),
           }, true);
           if (prevChannel && prevChannel.kind === 'relay') {

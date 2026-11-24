@@ -318,6 +318,13 @@ export function App() {
             dropUploadAckRef.current.delete(msg.transferId);
             resolve(msg);
           }
+          // Chunk-level failures arrive as an uncorrelated FS_ERROR: release any
+          // in-flight upload waiter so the UI reports it instead of hanging.
+          if (msg.type === MSG.FS_ERROR && dropUploadAckRef.current.size > 0) {
+            const pending = [...dropUploadAckRef.current.values()];
+            dropUploadAckRef.current.clear();
+            for (const resolve of pending) resolve({ ok: false, error: msg.error || '远端写入失败' });
+          }
           fsEventsRef.current.push(msg);
           setFsTick((n) => n + 1);
         } else if (msg.type === MSG.CLIPBOARD_DATA) {
@@ -466,26 +473,66 @@ export function App() {
           offset: 0,
         });
         const ack = await ackPromise;
+        if (ack && ack.ok === false) {
+          notify(`上传 ${file.name} 失败: ${ack.error || '远端无法创建文件'}`);
+          continue;
+        }
         let offset = Number.isFinite(ack?.offset) ? ack.offset : 0;
-        while (offset < file.size || file.size === 0) {
-          if (dropUploadCancelRef.current) {
-            t.sendBinary(FRAME_KIND.FILE_UP, { transferId, done: true }, new Uint8Array(0));
-            notify(`已取消上传 ${file.name}`);
-            return;
+        // Wait for the host to confirm the last chunk before reporting success:
+        // the write can still fail remotely (disk full, permission, path gone).
+        const donePromise = new Promise((resolve) => {
+          dropUploadAckRef.current.set(transferId, resolve);
+          setTimeout(() => {
+            if (dropUploadAckRef.current.has(transferId)) {
+              dropUploadAckRef.current.delete(transferId);
+              resolve(null);
+            }
+          }, 15000);
+        });
+        // Keep the socket send buffer shallow: pushing a whole file into it at
+        // once stalls the connection (and can kill the tab) on large uploads.
+        const HIGH_WATER = 4 * 1024 * 1024;
+        const drain = async () => {
+          while (t.bufferedAmount() > HIGH_WATER && !dropUploadCancelRef.current) {
+            await new Promise((r) => setTimeout(r, 8));
           }
-          const slice = file.slice(offset, offset + CHUNK);
-          const buf = new Uint8Array(await slice.arrayBuffer());
-          offset += buf.byteLength;
-          const done = offset >= file.size;
-          t.sendBinary(FRAME_KIND.FILE_UP, { transferId, done }, buf);
-          setDropUploadProgress({
-            fileName: file.name,
-            sent: offset,
-            total: file.size,
-            index: idx + 1,
-            count: filesArr.length,
-          });
-          if (done) break;
+        };
+        try {
+          while (offset < file.size || file.size === 0) {
+            if (dropUploadCancelRef.current) {
+              t.sendBinary(FRAME_KIND.FILE_UP, { transferId, done: true }, new Uint8Array(0));
+              notify(`已取消上传 ${file.name}`);
+              return;
+            }
+            const slice = file.slice(offset, offset + CHUNK);
+            const buf = new Uint8Array(await slice.arrayBuffer());
+            offset += buf.byteLength;
+            const done = offset >= file.size;
+            if (!t.sendBinary(FRAME_KIND.FILE_UP, { transferId, done }, buf)) {
+              throw new Error('连接已断开');
+            }
+            setDropUploadProgress({
+              fileName: file.name,
+              sent: offset,
+              total: file.size,
+              index: idx + 1,
+              count: filesArr.length,
+            });
+            if (done) break;
+            await drain();
+          }
+        } catch (err) {
+          notify(`上传 ${file.name} 失败: ${err?.message || err}`);
+          continue;
+        }
+        const finish = await donePromise;
+        if (finish && finish.ok === false) {
+          notify(`上传 ${file.name} 失败: ${finish.error || '远端写入失败'}`);
+          continue;
+        }
+        if (!finish) {
+          notify(`上传 ${file.name} 未收到远端确认，请检查远端目录`);
+          continue;
         }
         notify(`已上传 ${file.name} -> ${targetDir}`);
       }
@@ -495,10 +542,12 @@ export function App() {
   };
 
   const handleZoomChange = (z) => {
-    const want = z > 2.5;
-    if (want === hiResRef.current) return;
-    hiResRef.current = want;
-    transportRef.current?.sendJson({ type: MSG.SCREEN_CONFIG, hiRes: want });
+    // RemoteCanvas owns hiRes/roi: it is the only place that knows the visible
+    // rect, and it already drives hiRes together with the ROI. Sending hiRes
+    // from here too (with a different threshold) made the two writers flip the
+    // capture mode back and forth and force extra keyframes — that was the
+    // stutter seen when zooming/panning.
+    hiResRef.current = z > 1.8;
   };
 
   // Safety net: if H.264 never produces a decoded frame (bad bitstream, missing

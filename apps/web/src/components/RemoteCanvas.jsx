@@ -80,6 +80,10 @@ export function RemoteCanvas({
       return;
     }
     if (zoom <= 1.8) return;
+    // Re-requesting the ROI while the user is still panning makes the host force
+    // a keyframe every time, which shows up as stutter. Activate quickly the
+    // first time, then wait for the pan to settle before moving the region.
+    const settleMs = roiActiveRef.current ? 550 : 140;
     roiTimerRef.current = window.setTimeout(() => {
       const stage = stageRef.current;
       const canvas = canvasRef.current;
@@ -87,21 +91,24 @@ export function RemoteCanvas({
       const sr = stage.getBoundingClientRect();
       const cr = canvas.getBoundingClientRect();
       if (cr.width <= 0 || cr.height <= 0) return;
-      const pad = 0.06;
+      const pad = 0.08;
       const tlX = (sr.left - cr.left) / cr.width;
       const tlY = (sr.top - cr.top) / cr.height;
       const brX = (sr.right - cr.left) / cr.width;
       const brY = (sr.bottom - cr.top) / cr.height;
-      const rx = Math.max(0, Math.min(0.84, Math.round((tlX - pad) * 50) / 50));
-      const ry = Math.max(0, Math.min(0.84, Math.round((tlY - pad) * 50) / 50));
-      const rw = Math.max(0.16, Math.min(1 - rx, Math.round((brX - rx + pad) * 50) / 50));
-      const rh = Math.max(0.16, Math.min(1 - ry, Math.round((brY - ry + pad) * 50) / 50));
+      // Coarser grid: a 1/25 step keeps the region stable while panning instead
+      // of re-cutting a keyframe on every ~38px of movement.
+      const snap = (v) => Math.round(v * 25) / 25;
+      const rx = Math.max(0, Math.min(0.8, snap(tlX - pad)));
+      const ry = Math.max(0, Math.min(0.8, snap(tlY - pad)));
+      const rw = Math.max(0.2, Math.min(1 - rx, snap(brX - rx + pad)));
+      const rh = Math.max(0.2, Math.min(1 - ry, snap(brY - ry + pad)));
       const key = `${rx.toFixed(2)}:${ry.toFixed(2)}:${rw.toFixed(2)}:${rh.toFixed(2)}`;
       if (key === lastRoiKeyRef.current) return;
       lastRoiKeyRef.current = key;
       roiActiveRef.current = true;
       transport?.sendJson({ type: MSG.SCREEN_CONFIG, roi: { x: rx, y: ry, w: rw, h: rh }, hiRes: true });
-    }, 220);
+    }, settleMs);
   }, [zoom, pan, onZoomChange, transport]);
 
   useEffect(() => {
