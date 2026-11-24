@@ -160,11 +160,18 @@ export class NativeBridge extends EventEmitter {
       if (msg.op === 'pty_error') {
         this.emit('pty_error', msg);
       }
+      if (msg.op === 'audio_error') {
+        // Previously swallowed, which made "no sound" completely undiagnosable.
+        this.emit('audio_error', msg);
+      }
       if (msg.op === 'changed') {
         this.emit('clipboard_changed', {
           text: msg.text || '',
           imageBase64: msg.imageBase64 || '',
         });
+      }
+      if (!msg.reqId && msg.op && msg.op !== 'changed' && msg.op !== 'pty_error' && msg.op !== 'audio_error') {
+        this.emit('json_event', msg);
       }
       return;
     }

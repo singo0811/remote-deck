@@ -1034,18 +1034,29 @@ struct Index {
   }
 
   private async syncClipboard(): Promise<void> {
+    let localText = '';
+    let readError = '';
     try {
       const pb = pasteboard.getSystemPasteboard();
       const data = await pb.getData();
-      const txt = data?.getPrimaryText() || '';
-      if (txt.length > 0) {
-        const msg: OutMsgClipboardSet = { type: MsgType.CLIPBOARD_SET, text: txt };
-        this.client?.sendJson(msg);
-        this.showToast('已推送本机剪贴板到远端');
-        return;
-      }
-    } catch {
-      // Fall back to pulling remote clipboard
+      localText = data?.getPrimaryText() || '';
+    } catch (err) {
+      readError = err instanceof Error ? err.message : String(err);
+    }
+    if (localText.length > 0) {
+      const msg: OutMsgClipboardSet = { type: MsgType.CLIPBOARD_SET, text: localText };
+      this.client?.sendJson(msg);
+      this.showToast('已推送本机剪贴板到远端');
+      return;
+    }
+    // Reading the phone clipboard needs ohos.permission.READ_PASTEBOARD, which is
+    // ACL-restricted and unavailable to a debug-signed app. Say so instead of
+    // silently reversing direction (the old behaviour overwrote the local
+    // clipboard with the remote one and looked like nothing happened).
+    if (readError.length > 0) {
+      this.showToast('本机剪贴板读取被系统拒绝，已改为拉取远端内容');
+    } else {
+      this.showToast('本机剪贴板为空，已改为拉取远端内容');
     }
     const getMsg: OutMsgSimple = { type: MsgType.CLIPBOARD_GET };
     this.client?.sendJson(getMsg);

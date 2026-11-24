@@ -250,6 +250,18 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 	}
 	defer syscall.SyscallN(comMethod(audioClient, 11), audioClient) // Stop
 
+	// Report the negotiated format once: without this, "no sound" is impossible to
+	// diagnose because silent loopback buffers are filtered out below.
+	writeJSONFrame(evtJSON, map[string]any{
+		"op":          "audio_info",
+		"sampleRate":  int(wfx.NSamplesPerSec),
+		"channels":    int(wfx.NChannels),
+		"bitsPerSmpl": int(wfx.WBitsPerSample),
+		"blockAlign":  int(wfx.NBlockAlign),
+		"float":       isFloat,
+		"lowBandwidth": audioLowBandwidth.Load(),
+	})
+
 	srcRate := int(wfx.NSamplesPerSec)
 	srcCh := int(wfx.NChannels)
 	if srcRate <= 0 || srcCh <= 0 {
@@ -375,7 +387,15 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 			for {
 				var packetFrames uint32
 				r, _, _ := syscall.SyscallN(comMethod(captureClient, 5), captureClient, uintptr(unsafe.Pointer(&packetFrames)))
-				if r != 0 || packetFrames == 0 {
+				if r != 0 {
+					// Was silently swallowed, which looked exactly like "no audio device".
+					writeJSONFrame(evtJSON, map[string]any{
+						"op":    "audio_error",
+						"error": fmt.Sprintf("GetNextPacketSize failed: 0x%x", r),
+					})
+					return
+				}
+				if packetFrames == 0 {
 					break
 				}
 				var dataPtr uintptr
@@ -414,6 +434,18 @@ func runWasapiLoopback(stopCh chan struct{}, doneCh chan struct{}) {
 									fv = -1
 								}
 								s16 = int16(fv * 32767)
+							} else if !isFloat && bytesPerSample == 4 && srcIdx+4 <= len(raw) {
+								// 32-bit integer mix format (common for "audio enhancements"
+								// devices): the old code only handled float32/int16 here, so
+								// every sample became 0 and the silence filter dropped the
+								// whole stream — i.e. no audio at all.
+								s16 = int16(int32(binary.LittleEndian.Uint32(raw[srcIdx:srcIdx+4])) >> 16)
+							} else if !isFloat && bytesPerSample == 3 && srcIdx+3 <= len(raw) {
+								v := int32(raw[srcIdx]) | int32(raw[srcIdx+1])<<8 | int32(raw[srcIdx+2])<<16
+								if v&0x800000 != 0 {
+									v |= ^int32(0xFFFFFF)
+								}
+								s16 = int16(v >> 8)
 							} else if !isFloat && bytesPerSample == 2 && srcIdx+2 <= len(raw) {
 								s16 = int16(binary.LittleEndian.Uint16(raw[srcIdx : srcIdx+2]))
 							}

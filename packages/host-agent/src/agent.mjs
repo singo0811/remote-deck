@@ -310,6 +310,19 @@ export class HostAgent {
       }
     });
 
+    // Audio capture failures used to be dropped on the floor, so the phone just
+    // showed "no sound". Surface them, and tell subscribed clients why.
+    this.native.on('audio_error', (msg) => {
+      console.warn(`[remote-deck] audio capture error: ${msg?.error || 'unknown'}`);
+      for (const sess of this.audioSessions) {
+        sess.sendJson({ type: MSG.ERROR, code: 'audio_unavailable', error: msg?.error || 'audio capture failed' });
+      }
+    });
+
+    this.native.on('json_event', (msg) => {
+      if (msg?.op) console.warn(`[remote-deck] native event ${msg.op}: ${JSON.stringify(msg).slice(0, 200)}`);
+    });
+
     this.native.on('pty_opened', ({ id, mode }) => {
       const sess = this.ptyOwners.get(id);
       if (sess) sess.sendJson({ type: MSG.PTY_OPENED, id, mode });
