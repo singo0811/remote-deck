@@ -235,6 +235,53 @@ function bootTaskXml(svcExe, args) {
 </Task>`;
 }
 
+/**
+ * LAN clients cannot reach the host unless Windows lets inbound traffic through.
+ * The active network is often classified "Public", where inbound is blocked by
+ * default — the phone then silently falls back to the Tailscale overlay and every
+ * frame takes an extra internet detour (high latency, low throughput).
+ *
+ * The app runs with highest available privileges, so it can install the rules
+ * itself instead of leaving users to discover netsh.
+ */
+function ensureLanFirewallRules() {
+  if (process.platform !== 'win32') return;
+  const rules = [
+    { name: 'RemoteDeck Host (TCP 9601)', protocol: 'TCP', port: 9601 },
+    { name: 'RemoteDeck Discovery (UDP 9602)', protocol: 'UDP', port: 9602 },
+  ];
+  for (const rule of rules) {
+    try {
+      const existing = execFileSync('netsh', ['advfirewall', 'firewall', 'show', 'rule', `name=${rule.name}`], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 8000,
+      });
+      if (/RemoteDeck/i.test(existing)) continue;
+    } catch {
+      // Not present (or netsh could not read it) — fall through and try to add.
+    }
+    try {
+      execFileSync(
+        'netsh',
+        [
+          'advfirewall', 'firewall', 'add', 'rule',
+          `name=${rule.name}`,
+          'dir=in', 'action=allow',
+          `protocol=${rule.protocol}`,
+          `localport=${rule.port}`,
+          'profile=private,public',
+          'remoteip=localsubnet',
+        ],
+        { encoding: 'utf8', windowsHide: true, timeout: 8000 },
+      );
+      console.log(`[remote-deck] added firewall rule: ${rule.name}`);
+    } catch (err) {
+      console.warn(`[remote-deck] could not add firewall rule ${rule.name}: ${err.message}`);
+    }
+  }
+}
+
 /** Write a logon-trigger task that starts RemoteDeck with the highest available privileges. */
 async function writeAutostartTaskXml(exePath) {
   const user = `${process.env.USERDOMAIN || ''}\\${process.env.USERNAME || ''}`.replace(/^\\/, '');
@@ -382,6 +429,7 @@ async function ensureSharedIdentity(userData) {
 }
 
 async function startHostAgent() {
+  ensureLanFirewallRules();
   const userData = app.getPath('userData');
   // Identity must be shared: the SYSTEM-session watchdog and the normal desktop
   // app are different accounts, otherwise the device ID / PIN would differ.
