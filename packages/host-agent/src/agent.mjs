@@ -152,9 +152,12 @@ const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
 function channelProfile(channel) {
   switch (channel) {
     case 'relay':
-      return { qualityFactor: 0.55, maxWidthCap: 1600, fpsCap: 24 };
+      // A relayed stream used to lose half its quality the moment it started,
+      // which reads as "刚连上很模糊". ABR already steps down on real
+      // congestion, so start close to native quality and let it adapt.
+      return { qualityFactor: 0.82, maxWidthCap: 1920, fpsCap: 24 };
     case 'tunnel':
-      return { qualityFactor: 0.85, maxWidthCap: 1920, fpsCap: 18 };
+      return { qualityFactor: 0.9, maxWidthCap: 2048, fpsCap: 24 };
     case 'tailscale':
       return { qualityFactor: 0.9, maxWidthCap: 0, fpsCap: 0 };
     case 'webrtc':
@@ -212,6 +215,9 @@ export function effectiveStreamParams(streamConfig, { abrLevel = 0, channel = 'l
     quality -= [0, 10, 20, 30][level];
   }
   quality = Math.round(quality * profile.qualityFactor);
+  // While the link is healthy keep text crisp: CRF above ~24 makes small UI
+  // text mush, which is what "刚远程过去好模糊" looks like.
+  if (level === 0 && !streamConfig.hiRes) quality = Math.max(quality, 72);
   if (profile.maxWidthCap > 0 && (maxWidth === 0 || maxWidth > profile.maxWidthCap)) {
     maxWidth = profile.maxWidthCap;
     // A width cap must not be wider than what the preset asked for either.

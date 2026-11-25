@@ -805,7 +805,17 @@ app.whenReady().then(async () => {
   registerIpc();
   const status = await startHostAgent();
 
-  const iconImg = nativeImage.createFromBuffer(buildAppIconPng(64));
+  // Windows groups taskbar buttons by AppUserModelID; without an explicit one
+  // the packaged app inherits electron.exe's identity and shows its icon.
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.remotedeck.desktop');
+  }
+  app.setName('RemoteDeck');
+
+  const iconPath = path.join(__dirname, '..', 'assets', 'remotedeck.ico');
+  const iconImg = existsSync(iconPath)
+    ? nativeImage.createFromPath(iconPath)
+    : nativeImage.createFromBuffer(buildAppIconPng(64));
 
   if (!isSmokeTest) {
     tray = new Tray(iconImg);

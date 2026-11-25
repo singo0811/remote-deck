@@ -14,13 +14,15 @@ test('LAN keeps the preset the user picked', () => {
 
 test('relay/tunnel cap resolution, fps and bitrate-defining quality', () => {
   const relay = effectiveStreamParams(uhd, { abrLevel: 0, channel: 'relay' });
-  assert.ok(relay.maxWidth > 0 && relay.maxWidth <= 1600, `relay width ${relay.maxWidth}`);
+  assert.ok(relay.maxWidth > 0 && relay.maxWidth <= 1920, `relay width ${relay.maxWidth}`);
   assert.ok(relay.fps <= 24, `relay fps ${relay.fps}`);
   assert.ok(relay.quality < 92, `relay quality ${relay.quality}`);
+  // A fresh relayed session must not start out blurry.
+  assert.ok(relay.quality >= 70, `relay quality should stay usable, got ${relay.quality}`);
 
   const tunnel = effectiveStreamParams(uhd, { abrLevel: 0, channel: 'tunnel' });
-  assert.equal(tunnel.maxWidth, 1920);
-  assert.equal(tunnel.fps, 18);
+  assert.equal(tunnel.maxWidth, 2048);
+  assert.equal(tunnel.fps, 24);
   assert.ok(tunnel.quality > relay.quality && tunnel.quality < uhd.quality);
 });
 
@@ -50,7 +52,7 @@ test('auto mode still uses the ABR tiers and stays WAN-capped', () => {
   assert.ok(auto3.quality < auto0.quality);
   assert.ok(auto3.maxWidth <= auto0.maxWidth);
   const autoRelay = effectiveStreamParams({ ...uhd, auto: true }, { abrLevel: 0, channel: 'relay' });
-  assert.ok(autoRelay.maxWidth > 0 && autoRelay.maxWidth <= 1600);
+  assert.ok(autoRelay.maxWidth > 0 && autoRelay.maxWidth <= 1920);
 });
 
 test('zoom (hiRes) still prefers full resolution', () => {
