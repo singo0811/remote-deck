@@ -116,18 +116,22 @@ for (const dep of Object.keys(agentPkg.dependencies || {})) {
 
 console.log(`Packaged ${visited.size} runtime npm modules + RemoteDeck.exe`);
 
-// Keep the Windows guardian service pointed at this build. It otherwise keeps
-// relaunching a stale copy from whatever path it was installed with, which
-// looks like "the new icon / UI never showed up".
+// Keep the Windows guardian service pointed at the build we just wrote. It
+// otherwise keeps relaunching a stale copy from whatever path it was installed
+// with, which looks like "the new icon / UI never showed up". The installed
+// copy under %LOCALAPPDATA% wins when present, because that is what the Start
+// Menu shortcut and the uninstaller use.
 try {
   const svcConfigPath = path.join(process.env.ProgramData || 'C:\\ProgramData', 'RemoteDeck', 'svc-config.json');
   if (existsSync(svcConfigPath)) {
     const svcConfig = JSON.parse(readFileSync(svcConfigPath, 'utf8'));
     const exePath = path.join(outDir, 'RemoteDeck.exe');
-    if (svcConfig.appPath !== exePath) {
-      svcConfig.appPath = exePath;
+    const installedPath = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'RemoteDeck', 'RemoteDeck.exe');
+    const desired = process.env.LOCALAPPDATA && existsSync(installedPath) ? installedPath : exePath;
+    if (svcConfig.appPath !== desired) {
+      svcConfig.appPath = desired;
       writeFileSync(svcConfigPath, JSON.stringify(svcConfig, null, 2), 'utf8');
-      console.log(`Guardian service now launches: ${exePath}`);
+      console.log(`Guardian service now launches: ${desired}`);
     }
   }
 } catch (err) {
