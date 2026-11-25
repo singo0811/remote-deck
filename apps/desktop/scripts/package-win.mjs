@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -115,4 +115,23 @@ for (const dep of Object.keys(agentPkg.dependencies || {})) {
 }
 
 console.log(`Packaged ${visited.size} runtime npm modules + RemoteDeck.exe`);
+
+// Keep the Windows guardian service pointed at this build. It otherwise keeps
+// relaunching a stale copy from whatever path it was installed with, which
+// looks like "the new icon / UI never showed up".
+try {
+  const svcConfigPath = path.join(process.env.ProgramData || 'C:\\ProgramData', 'RemoteDeck', 'svc-config.json');
+  if (existsSync(svcConfigPath)) {
+    const svcConfig = JSON.parse(readFileSync(svcConfigPath, 'utf8'));
+    const exePath = path.join(outDir, 'RemoteDeck.exe');
+    if (svcConfig.appPath !== exePath) {
+      svcConfig.appPath = exePath;
+      writeFileSync(svcConfigPath, JSON.stringify(svcConfig, null, 2), 'utf8');
+      console.log(`Guardian service now launches: ${exePath}`);
+    }
+  }
+} catch (err) {
+  console.log(`Guardian config not updated: ${err.message}`);
+}
+
 console.log(`Done: ${path.join(outDir, 'RemoteDeck.exe')}`);
