@@ -228,6 +228,43 @@ export function ConnectView({
     return s.startsWith('http://') || s.startsWith('https://') || s.startsWith('ws://') || s.startsWith('wss://') || s.includes('.') || s.includes(':');
   };
 
+  const relayBase = () => {
+    const base = (typeof accountApiBase === 'function' ? accountApiBase() : '') || serverUrl.trim();
+    return String(base || '').replace(/^ws:/i, 'http:').replace(/^wss:/i, 'https:').replace(/\/ws$/i, '');
+  };
+
+  /** LAN address for a device when we can reach it directly, otherwise empty. */
+  const lanUrlFor = (dev) => {
+    const eps = dev?.lanEndpoints || [];
+    if (!eps.length) return '';
+    const host = (() => {
+      try {
+        return new URL(toHttpBase(serverUrl || window.location.origin)).hostname;
+      } catch {
+        return window.location.hostname;
+      }
+    })();
+    const sameSubnet = eps.find((ep) => {
+      if (!ep.ip || ep.virtual) return false;
+      const a = ep.ip.split('.');
+      const b = String(host || '').split('.');
+      return a.length === 4 && b.length === 4 && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+    });
+    if (sameSubnet) return sameSubnet.httpUrl || sameSubnet.wsUrl || '';
+    const nonVirtual = eps.find((ep) => !ep.virtual);
+    // A device on the same LAN answers on a plain IP; anything else goes relay.
+    return nonVirtual && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.)/.test(nonVirtual.ip || '')
+      ? (nonVirtual.httpUrl || nonVirtual.wsUrl || '')
+      : '';
+  };
+
+  const routeFor = (dev) => {
+    const lan = lanUrlFor(dev);
+    if (lan) return { mode: 'direct', serverUrl: lan, fallbackUrl: dev?.tunnelUrl || relayBase() };
+    if (dev?.tunnelUrl) return { mode: 'direct', serverUrl: dev.tunnelUrl, fallbackUrl: relayBase() };
+    return { mode: 'relay', serverUrl: relayBase(), fallbackUrl: '' };
+  };
+
   const handleSubmit = (e) => {
     e.preventDefault();
     const rawId = deviceId.trim();
@@ -246,52 +283,36 @@ export function ConnectView({
 
     const matchedDev = devices.find((d) => d.deviceId === rawId);
     const matchedRecent = recent.find((r) => r.deviceId === rawId);
-    const fallbackUrl = matchedDev?.tunnelUrl || matchedRecent?.tunnelUrl || '';
-    if (matchedDev && mode === 'direct') {
-      const eps = matchedDev.lanEndpoints || [];
-      const target = eps.find((ep) => !ep.virtual) || eps[0];
-      const targetUrl = target?.httpUrl || matchedDev.tunnelUrl || serverUrl.trim();
-      onConnect({
-        mode: 'direct',
-        serverUrl: targetUrl,
-        deviceId: rawId,
-        pin: rawPin,
-        fallbackUrl,
-      });
-      return;
-    }
+    const route = matchedDev
+      ? routeFor(matchedDev)
+      : matchedRecent
+        ? {
+            mode: matchedRecent.mode === 'direct' && matchedRecent.serverUrl ? 'direct' : 'relay',
+            serverUrl: matchedRecent.serverUrl || relayBase(),
+            fallbackUrl: matchedRecent.tunnelUrl || '',
+          }
+        : { mode: 'relay', serverUrl: relayBase(), fallbackUrl: '' };
 
-    if (mode === 'relay' && !rawId) return;
+    if (!route.serverUrl) return;
+    setMode(route.mode);
+    setServerUrl(route.serverUrl);
     onConnect({
-      mode,
-      serverUrl: serverUrl.trim(),
+      mode: route.mode,
+      serverUrl: route.serverUrl,
       deviceId: rawId,
       pin: rawPin,
-      fallbackUrl,
+      fallbackUrl: route.fallbackUrl,
     });
   };
 
   const handlePickDevice = (dev) => {
     const nextId = dev.deviceId;
     setDeviceId(nextId);
-    let nextMode = mode;
-    let nextServer = serverUrl;
-    if (dev.lanEndpoints?.length) {
-      const curHost = (() => {
-        try {
-          return new URL(toHttpBase(serverUrl)).hostname;
-        } catch {
-          return window.location.hostname;
-        }
-      })();
-      if (dev.lanEndpoints.some((ep) => ep.ip === curHost)) {
-        nextMode = 'direct';
-        setMode('direct');
-      } else if (mode === 'direct') {
-        nextServer = (dev.lanEndpoints.find((ep) => !ep.virtual) || dev.lanEndpoints[0]).httpUrl || serverUrl;
-        setServerUrl(nextServer);
-      }
-    }
+    const route = routeFor(dev);
+    const nextMode = route.mode;
+    const nextServer = route.serverUrl || serverUrl;
+    setMode(nextMode);
+    if (nextServer) setServerUrl(nextServer);
     const savedPin =
       (deviceId === nextId && pin.trim()) ||
       recent.find((r) => r.deviceId === nextId && r.pin)?.pin ||
@@ -407,19 +428,8 @@ export function ConnectView({
           </div>
         </div>
         <div className="qr-tabs" style={{ width: 'auto' }}>
-          <button
-            type="button"
-            className={`qr-tab ${mode === 'direct' ? 'active' : ''}`}
-            onClick={() => setMode('direct')}
-          >
-            直连
-          </button>
-          <button
-            type="button"
-            className={`qr-tab ${mode === 'relay' ? 'active' : ''}`}
-            onClick={() => setMode('relay')}
-          >
-            公网
+          <button type="button" className="qr-tab" onClick={fetchDevices}>
+            刷新
           </button>
         </div>
       </div>
