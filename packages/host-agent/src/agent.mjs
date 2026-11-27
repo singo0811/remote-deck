@@ -148,6 +148,32 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024; // 4 MiB backpressure limit
  */
 const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
 
+/** Read a small JSON request body. */
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 1024 * 1024) {
+        req.destroy();
+        reject(new Error('body too large'));
+      }
+    });
+    req.on('end', () => {
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 /** Channel classes: how much we trust a transport path for realtime video. */
 function channelProfile(channel) {
   switch (channel) {
@@ -946,7 +972,48 @@ export class HostAgent {
           displays: this.displays,
           lanEndpoints: this.getLanEndpoints(),
           tunnelUrl: this.tunnelUrl,
+          relayUrl: this.relayUrl,
+          relayConnected: Boolean(this.relayConnected),
+          pin: this.pin,
         }));
+        return;
+      }
+      // Control plane for a second, window-only instance on the same machine:
+      // it has no agent of its own, so it drives the host that owns the port.
+      if (url.pathname.startsWith('/api/host/') && req.method === 'POST') {
+        const body = await readJsonBody(req).catch(() => ({}));
+        // Loopback only: this is the desktop UI of the same user session.
+        const peer = req.socket?.remoteAddress || '';
+        if (!/^(127\.|::1$|::ffff:127\.)/.test(peer)) return forbid();
+        if (url.pathname === '/api/host/permissions') {
+          const next = this.setPermissions(body.permissions || {});
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, permissions: next }));
+          return;
+        }
+        if (url.pathname === '/api/host/pin') {
+          const pin = await this.regeneratePin();
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, pin }));
+          return;
+        }
+        if (url.pathname === '/api/host/relay') {
+          this.relayUrl = String(body.relayUrl || '');
+          this.relaySecret = String(body.relaySecret || '');
+          this.#connectRelay();
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, relayUrl: this.relayUrl }));
+          return;
+        }
+        if (url.pathname === '/api/host/tunnel') {
+          const enabled = Boolean(body.enabled);
+          await this.setQuickTunnel(enabled).catch(() => {});
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, tunnelUrl: this.tunnelUrl }));
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Unknown host action' }));
         return;
       }
       if (url.pathname === '/api/devices') {

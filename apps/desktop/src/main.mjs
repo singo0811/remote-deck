@@ -31,6 +31,42 @@ const uiOnlyInstance = !isHeadlessInstance && !gotLock;
 let mainWindow = null;
 let tray = null;
 let agent = null;
+let reusedHostStatus = null;
+
+/** Status of the host this window drives: ours, or the one already on the port. */
+function currentStatus() {
+  return agent?.getHostStatus() || reusedHostStatus || null;
+}
+
+/** Ask the host that owns the LAN port to perform an action for this window. */
+async function callReusedHost(action, body = {}) {
+  const port = reusedHostStatus?.lanPort || 9601;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/host/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    const payload = await res.json().catch(() => ({}));
+    await refreshReusedStatus(port);
+    return payload;
+  } catch (err) {
+    return { ok: false, error: err?.message || '宿主未响应' };
+  }
+}
+
+async function refreshReusedStatus(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/info`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return;
+    const info = await res.json();
+    if (info && info.deviceId) {
+      reusedHostStatus = { ...reusedHostStatus, ...info, lanPort: port, reusedHost: true };
+      broadcastStatus(reusedHostStatus);
+    }
+  } catch {}
+}
 let isQuitting = false;
 let settingsPath = '';
 let desktopSettings = {
@@ -379,7 +415,7 @@ function broadcastStatus(status) {
 
 function refreshTrayMenu(status) {
   if (!tray) return;
-  const st = status || agent?.getHostStatus();
+  const st = status || currentStatus();
   const menu = Menu.buildFromTemplate([
     {
       label: st ? `设备 ID: ${st.deviceId}` : 'RemoteDeck 运行中',
@@ -511,7 +547,8 @@ async function startHostAgent() {
   if (uiOnlyInstance) {
     const existing = await probeLocalHost(preferredPort);
     if (existing && existing.deviceId) {
-      return { ...existing, lanPort: preferredPort, pin: '', reusedHost: true };
+      reusedHostStatus = { ...existing, lanPort: preferredPort, reusedHost: true };
+      return reusedHostStatus;
     }
   }
 
@@ -557,9 +594,17 @@ async function startHostAgent() {
 }
 
 function registerIpc() {
-  ipcMain.handle('rd:get-host-status', () => agent?.getHostStatus() || null);
-  ipcMain.handle('rd:regenerate-pin', async () => await agent?.regeneratePin());
+  ipcMain.handle('rd:get-host-status', () => currentStatus() || null);
+  ipcMain.handle('rd:regenerate-pin', async () =>
+    agent ? await agent.regeneratePin() : await callReusedHost('pin'));
   ipcMain.handle('rd:set-permissions', async (_ev, perms) => {
+    if (!agent && reusedHostStatus) {
+      const res = await callReusedHost('permissions', { permissions: perms });
+      const next = res?.permissions || perms;
+      desktopSettings.permissions = next;
+      await saveSettings();
+      return next;
+    }
     const next = agent?.setPermissions(perms);
     desktopSettings.permissions = next;
     await saveSettings();
@@ -567,19 +612,30 @@ function registerIpc() {
   });
   ipcMain.handle('rd:set-quick-tunnel', async (_ev, enabled) => {
     desktopSettings.quickTunnel = Boolean(enabled);
-    agent?.setQuickTunnel(desktopSettings.quickTunnel);
+    if (!agent && reusedHostStatus) {
+      await callReusedHost('tunnel', { enabled: desktopSettings.quickTunnel });
+    } else {
+      agent?.setQuickTunnel(desktopSettings.quickTunnel);
+    }
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:set-relay-config', async (_ev, cfg) => {
     desktopSettings.relayUrl = String(cfg?.relayUrl || '').trim();
     desktopSettings.relaySecret = String(cfg?.relaySecret || '').trim();
-    agent?.setRelayConfig({
-      relayUrl: desktopSettings.relayUrl,
-      relaySecret: desktopSettings.relaySecret,
-    });
+    if (!agent && reusedHostStatus) {
+      await callReusedHost('relay', {
+        relayUrl: desktopSettings.relayUrl,
+        relaySecret: desktopSettings.relaySecret,
+      });
+    } else {
+      agent?.setRelayConfig({
+        relayUrl: desktopSettings.relayUrl,
+        relaySecret: desktopSettings.relaySecret,
+      });
+    }
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:get-relay-config', () => ({
     relayUrl: desktopSettings.relayUrl || '',
@@ -597,28 +653,28 @@ function registerIpc() {
       authKey: desktopSettings.tsnetAuthKey,
     });
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:logout-tsnet', async () => {
     desktopSettings.tsnetEnabled = false;
     desktopSettings.tsnetAuthKey = '';
     agent?.logoutTsnet();
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:set-security', async (_ev, sec) => {
     const next = agent?.setSecurityOptions(sec);
     if (typeof next?.requireApproval === 'boolean') desktopSettings.requireApproval = next.requireApproval;
     if (typeof next?.autoRotatePin === 'boolean') desktopSettings.autoRotatePin = next.autoRotatePin;
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:set-privacy', async (_ev, enabled) => {
     try {
       await agent?.setPrivacy(Boolean(enabled));
-      return { ok: true, status: agent?.getHostStatus() };
+      return { ok: true, status: currentStatus() };
     } catch (err) {
-      return { ok: false, error: err?.message || '隐私黑屏开启失败', status: agent?.getHostStatus() };
+      return { ok: false, error: err?.message || '隐私黑屏开启失败', status: currentStatus() };
     }
   });
   ipcMain.handle('rd:relaunch-admin', async () => {
@@ -649,7 +705,7 @@ function registerIpc() {
       hostname: desktopSettings.tunnelHostname,
     });
     await saveSettings();
-    return agent?.getHostStatus();
+    return currentStatus();
   });
   ipcMain.handle('rd:get-tunnel-config', () => ({
     token: desktopSettings.tunnelToken || '',
