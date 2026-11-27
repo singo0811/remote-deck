@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import dgram from 'node:dgram';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
@@ -6,6 +7,7 @@ import { Worker } from 'node:worker_threads';
 import os from 'node:os';
 import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
+import { Resolver } from 'node:dns/promises';
 import { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } from 'werift';
 import {
   FRAME_KIND,
@@ -147,6 +149,19 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024; // 4 MiB backpressure limit
  * delay.
  */
 const VIDEO_LATENCY_BUDGET_BYTES = 200 * 1024;
+
+/**
+ * DNS lookup that always answers with one pinned address. Newer Node asks for
+ * the `all` form (an array of {address, family}), so both shapes are handled.
+ */
+function makePinnedLookup(ip) {
+  return (hostname, options, callback) => {
+    const cb = typeof options === 'function' ? options : callback;
+    const wantAll = options && typeof options === 'object' && options.all;
+    if (wantAll) cb(null, [{ address: ip, family: 4 }]);
+    else cb(null, ip, 4);
+  };
+}
 
 /** Read a small JSON request body. */
 function readJsonBody(req) {
@@ -450,6 +465,8 @@ export class HostAgent {
     this.relayWatchdog = null;
     this.lastRelayError = '';
     this.relayAttemptAt = 0;
+    this.relayAttempts = 0;
+    this.relayBackoffMs = 0;
     this.heartbeatTimer = null;
     this.stopped = false;
     this.displays = [];
@@ -837,14 +854,16 @@ export class HostAgent {
       clearInterval(this.relayWatchdog);
       this.relayWatchdog = setInterval(() => {
         if (this.stopped || !this.relayUrl || this.relayConnected) return;
-        const state = this.relayWs?.readyState;
-        if (state === WebSocket.CONNECTING) return;
-        // Force a fresh socket: a half-open one never emits close, so a plain
-        // reconnect would stack sockets that all stay stuck.
+        if (this.reconnectTimer) return;
+        const age = Date.now() - (this.relayAttemptAt || 0);
+        // Only step in when attempts have gone quiet: a fresh attempt (or its
+        // hedge) still deserves its handshake window.
+        if (this.relaySockets && this.relaySockets.size > 0 && age < 8000) return;
+        if (age < 3000) return;
         try { this.relayWs?.terminate?.(); } catch {}
         this.relayWs = null;
         this.#connectRelay();
-      }, 15000);
+      }, 5000);
       // Never keep the process (or a test runner) alive just for this timer.
       this.relayWatchdog.unref?.();
     }
@@ -856,7 +875,13 @@ export class HostAgent {
   async stop() {
     this.stopped = true;
     clearTimeout(this.reconnectTimer);
+    clearTimeout(this.relayHedgeTimer);
     clearInterval(this.relayWatchdog);
+    for (const sock of this.relaySockets || []) {
+      try { sock.terminate?.(); } catch {}
+    }
+    if (this.relaySockets) this.relaySockets.clear();
+    this.relayConnected = false;
     clearInterval(this.heartbeatTimer);
 
     for (const sess of [...this.sessions]) {
@@ -1311,11 +1336,141 @@ export class HostAgent {
 
   #connectRelay() {
     if (this.stopped || !this.relayUrl) return;
+    // One socket at a time, retried quickly after a failed handshake: on a
+    // lossy or filtered link that turns "有网却连不上" into a connection within
+    // a couple of seconds.
+    this.#openRelaySocket('primary');
+  }
+
+
+  /**
+   * Some local VPN/DNS setups answer with a fake address (198.18.0.0/15) for
+   * every hostname and expect a proxy to handle it. Raw TLS then hangs forever.
+   * Resolve the relay through public resolvers and pin the real address.
+   */
+  async #prepareRelayLookup() {
+    const host = (() => {
+      try {
+        return new URL(normalizeRelayWsUrl(this.relayUrl)).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    if (!host || /^[\d.]+$/.test(host) || host.includes(':')) {
+      this.relayLookup = null;
+      return;
+    }
+    if (this.relayLookup && this.relayLookupHost === host && Date.now() - (this.relayLookupAt || 0) < 600000) {
+      return;
+    }
+
+    // A local VPN/TUN in fake-IP mode answers *every* DNS query (even to public
+    // resolvers) with 198.18.x.x and relies on its proxy; raw TLS to that address
+    // simply hangs. Ask DNS over HTTPS by IP so the real address comes back.
+    const dodgy = (ip) => /^198\.(1[89]|2[0-9])\./.test(ip);
+    const doh = [
+      { ip: '223.5.5.5', path: (n) => `/resolve?name=${n}&type=A`, servername: 'dns.alidns.com' },
+      { ip: '1.1.1.1', path: (n) => `/dns-query?name=${n}&type=A`, servername: 'cloudflare-dns.com' },
+    ];
+
+    for (const entry of doh) {
+      try {
+        const ip = await new Promise((resolve, reject) => {
+          const req = https.get(
+            {
+              host: entry.ip,
+              port: 443,
+              path: entry.path(host),
+              headers: { accept: 'application/dns-json' },
+              // Certificate name differs from the IP we dial; the relay itself is
+              // still verified end-to-end right after this lookup.
+              servername: entry.servername,
+              rejectUnauthorized: false,
+              timeout: 4000,
+            },
+            (res) => {
+              let raw = '';
+              res.on('data', (c) => { raw += c; });
+              res.on('end', () => {
+                try {
+                  const body = JSON.parse(raw);
+                  const answer = (body.Answer || []).find((a) => a.type === 1 && a.data);
+                  resolve(answer ? answer.data : '');
+                } catch (err) {
+                  reject(err);
+                }
+              });
+            },
+          );
+          req.on('error', reject);
+          req.on('timeout', () => { req.destroy(new Error('doh timeout')); });
+        });
+        if (ip && !dodgy(ip)) {
+          this.relayLookup = makePinnedLookup(ip);
+          this.relayLookupHost = host;
+          this.relayLookupAt = Date.now();
+          this.relayResolvedIp = ip;
+          return;
+        }
+      } catch {}
+    }
+
+    for (const server of ['223.5.5.5', '119.29.29.29', '1.1.1.1']) {
+      try {
+        const resolver = new Resolver({ timeout: 2000, tries: 1 });
+        resolver.setServers([server]);
+        const addrs = await resolver.resolve4(host);
+        const real = addrs.find((ip) => !dodgy(ip));
+        if (real) {
+          this.relayLookup = makePinnedLookup(real);
+          this.relayLookupHost = host;
+          this.relayLookupAt = Date.now();
+          this.relayResolvedIp = real;
+          return;
+        }
+      } catch {}
+    }
+    this.relayLookup = null;
+  }
+
+  #openRelaySocket(role) {
+    if (this.stopped || !this.relayUrl) return;
     this.relayAttemptAt = Date.now();
-    const ws = new WebSocket(normalizeRelayWsUrl(this.relayUrl), { handshakeTimeout: 8000 });
-    this.relayWs = ws;
+    this.relayAttempts = (this.relayAttempts || 0) + 1;
+
+    const target = normalizeRelayWsUrl(this.relayUrl);
+    const secure = target.startsWith('wss:');
+    // TLS 1.2 ceiling: some networks drop the TLS 1.3 handshake outright, which
+    // is exactly the "有网却连不上" symptom. Plain ws:// (local relay) has no TLS.
+    if (secure && !this.relayAgent) {
+      this.relayAgent = new https.Agent({ maxVersion: 'TLSv1.2', keepAlive: false });
+    }
+    const opts = { handshakeTimeout: 12000, ...(secure ? { agent: this.relayAgent } : {}) };
+    const ws = new WebSocket(target, opts);
+    if (role === 'primary' || !this.relayWs) this.relayWs = ws;
+    if (!this.relaySockets) this.relaySockets = new Set();
+    this.relaySockets.add(ws);
+
+    const retire = () => {
+      this.relaySockets.delete(ws);
+      try { ws.terminate?.(); } catch {}
+    };
 
     ws.on('open', () => {
+      // Another socket already won: drop this one.
+      if (this.relayConnected && this.relayWs !== ws) {
+        retire();
+        return;
+      }
+      this.relayWs = ws;
+      this.relayBackoffMs = 0;
+      clearTimeout(this.relayHedgeTimer);
+      for (const other of [...this.relaySockets]) {
+        if (other !== ws) {
+          this.relaySockets.delete(other);
+          try { other.terminate?.(); } catch {}
+        }
+      }
       ws.send(JSON.stringify({
         type: MSG.AGENT_REGISTER,
         deviceId: this.deviceId,
@@ -1345,6 +1500,7 @@ export class HostAgent {
         this.sessionBindSecret = msg.sessionBindSecret || '';
         this.iceServers = msg.iceServers || [];
         this.relayConnected = true;
+        this.lastRelayError = '';
         this.#notifyStatus();
         return;
       }
@@ -1370,20 +1526,39 @@ export class HostAgent {
     });
 
     ws.on('close', () => {
+      this.relaySockets.delete(ws);
+      if (this.relayWs !== ws) return;
       clearInterval(this.heartbeatTimer);
-      if (this.relayWs === ws) {
-        this.relayConnected = false;
-        this.#notifyStatus();
-        if (!this.stopped && this.relayUrl) {
-          this.reconnectTimer = setTimeout(() => this.#connectRelay(), 3000);
-        }
-      }
+      this.relayConnected = false;
+      this.#notifyStatus();
+      this.#scheduleRelayRetry();
     });
 
     ws.on('error', (err) => {
       this.lastRelayError = String(err?.message || err);
       console.error('[relay] socket error:', this.lastRelayError);
+      this.relaySockets.delete(ws);
+      // A failed handshake may never emit close; treat it as a failed attempt.
+      if (this.relayWs === ws && !this.relayConnected) {
+        this.#scheduleRelayRetry();
+      }
     });
+  }
+
+  /** Back off 1s → 2s → 4s → 8s, and never stack timers. */
+  #scheduleRelayRetry() {
+    if (this.stopped || !this.relayUrl) return;
+    if (this.reconnectTimer) return;
+    const delay = this.relayBackoffMs || 300;
+    this.relayBackoffMs = Math.min(Math.round(delay * 1.8), 4000);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.relayConnected || this.stopped) return;
+      try { this.relayWs?.terminate?.(); } catch {}
+      this.relayWs = null;
+      this.#connectRelay();
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   #sendHeartbeat() {
