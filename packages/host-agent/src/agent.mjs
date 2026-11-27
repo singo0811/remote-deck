@@ -447,6 +447,7 @@ export class HostAgent {
     this.sessionBindSecret = '';
     this.iceServers = [];
     this.reconnectTimer = null;
+    this.relayWatchdog = null;
     this.heartbeatTimer = null;
     this.stopped = false;
     this.displays = [];
@@ -829,6 +830,17 @@ export class HostAgent {
     }
     if (this.relayUrl) {
       this.#connectRelay();
+      // A silent socket failure (proxy drop, idle timeout) would otherwise leave
+      // the machine missing from the relay forever: nothing re-arms it.
+      clearInterval(this.relayWatchdog);
+      this.relayWatchdog = setInterval(() => {
+        if (this.stopped || !this.relayUrl || this.relayConnected) return;
+        const state = this.relayWs?.readyState;
+        if (state === WebSocket.CONNECTING) return;
+        this.#connectRelay();
+      }, 15000);
+      // Never keep the process (or a test runner) alive just for this timer.
+      this.relayWatchdog.unref?.();
     }
 
     this.#notifyStatus();
@@ -838,6 +850,7 @@ export class HostAgent {
   async stop() {
     this.stopped = true;
     clearTimeout(this.reconnectTimer);
+    clearInterval(this.relayWatchdog);
     clearInterval(this.heartbeatTimer);
 
     for (const sess of [...this.sessions]) {

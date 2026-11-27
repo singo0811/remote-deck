@@ -125,7 +125,8 @@ console.log(`Packaged ${visited.size} runtime npm modules + RemoteDeck.exe`);
 try {
   const svcConfigPath = path.join(process.env.ProgramData || 'C:\\ProgramData', 'RemoteDeck', 'svc-config.json');
   if (existsSync(svcConfigPath)) {
-    const svcConfig = JSON.parse(readFileSync(svcConfigPath, 'utf8'));
+    const raw = readFileSync(svcConfigPath, 'utf8').replace(/^\uFEFF/, '');
+    const svcConfig = JSON.parse(raw);
     const exePath = path.join(outDir, 'RemoteDeck.exe');
     const installedPath = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'RemoteDeck', 'RemoteDeck.exe');
     const desired = process.env.LOCALAPPDATA && existsSync(installedPath) ? installedPath : exePath;

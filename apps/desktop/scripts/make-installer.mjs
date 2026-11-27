@@ -66,7 +66,7 @@ rem Make sure the current user really owns every installed file.
 icacls "%DEST%" /grant "%USERNAME%:(OI)(CI)F" /T /C /Q >nul 2>&1
 
 echo   更新看护服务启动路径...
-powershell -NoProfile -Command "$p=Join-Path $env:ProgramData 'RemoteDeck\\svc-config.json'; if (Test-Path $p) { try { $j = Get-Content $p -Raw | ConvertFrom-Json; $j.appPath = '%EXE%'; ($j | ConvertTo-Json -Depth 4) | Set-Content $p -Encoding utf8 } catch {} }" >nul 2>&1
+powershell -NoProfile -Command "$p=Join-Path $env:ProgramData 'RemoteDeck\\svc-config.json'; if (Test-Path $p) { try { $j = Get-Content $p -Raw | ConvertFrom-Json; $j.appPath = '%EXE%'; [IO.File]::WriteAllText($p, ($j | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false))) } catch {} }" >nul 2>&1
 
 echo   创建快捷方式...
 set "PS=%TEMP%\\rd-shortcuts.ps1"
