@@ -8,7 +8,7 @@
 
 | 包 | 说明 |
 |---|---|
-| `RemoteDeck-*-Setup-win-x64.zip` | Windows 安装版：解压后双击「安装.cmd」，装到当前用户目录，创建桌面/开始菜单快捷方式，可在「设置 → 应用」里卸载 |
+| `RemoteDeck-*-Setup-win-x64.zip` | Windows 安装版：解压后双击「安装.cmd」，装到 `%LOCALAPPDATA%\Programs\RemoteDeck-<版本>`，创建桌面/开始菜单快捷方式，可在「设置 → 应用」里卸载 |
 | `RemoteDeck-*-win-x64.zip` | Windows 绿色版：解压直接运行 `RemoteDeck.exe`，不依赖本机 Node.js |
 | `RemoteDeck-*-harmony.hap` | 鸿蒙手机 / 平板安装包 |
 

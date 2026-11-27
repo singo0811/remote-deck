@@ -33,7 +33,7 @@ const installCmd = `@echo off
 setlocal EnableExtensions
 title RemoteDeck ${version} 安装
 set "SRC=%~dp0payload"
-set "DEST=%LOCALAPPDATA%\\Programs\\RemoteDeck"
+set "DEST=%LOCALAPPDATA%\\Programs\\RemoteDeck-${version}"
 set "EXE=%DEST%\\RemoteDeck.exe"
 set "ICON=%DEST%\\resources\\app\\apps\\desktop\\assets\\remotedeck.ico"
 
@@ -45,19 +45,28 @@ echo.
 
 taskkill /IM RemoteDeck.exe /F >nul 2>&1
 
+rem A previous install can leave file handles/ACLs behind (the SYSTEM watchdog
+rem may still hold the old copy). Move it aside instead of deleting in place so
+rem one unreadable file cannot poison the new install.
 if exist "%DEST%" (
-  echo   清理旧版本...
-  rd /s /q "%DEST%" >nul 2>&1
+  echo   停用旧版本...
+  set "OLD=%DEST%.old-%RANDOM%%RANDOM%"
+  call :retire "%DEST%"
 )
 mkdir "%DEST%" >nul 2>&1
 
 echo   复制文件...
-robocopy "%SRC%" "%DEST%" /E /NFL /NDL /NJH /NJS /NP >nul
+robocopy "%SRC%" "%DEST%" /E /IS /NFL /NDL /NJH /NJS /NP /COPY:DAT >nul
 if errorlevel 8 (
   echo   [失败] 复制文件出错，请检查磁盘空间。
   pause
   exit /b 1
 )
+rem Make sure the current user really owns every installed file.
+icacls "%DEST%" /grant "%USERNAME%:(OI)(CI)F" /T /C /Q >nul 2>&1
+
+echo   更新看护服务启动路径...
+powershell -NoProfile -Command "$p=Join-Path $env:ProgramData 'RemoteDeck\\svc-config.json'; if (Test-Path $p) { try { $j = Get-Content $p -Raw | ConvertFrom-Json; $j.appPath = '%EXE%'; ($j | ConvertTo-Json -Depth 4) | Set-Content $p -Encoding utf8 } catch {} }" >nul 2>&1
 
 echo   创建快捷方式...
 set "PS=%TEMP%\\rd-shortcuts.ps1"
@@ -96,12 +105,21 @@ echo   安装完成，正在启动 RemoteDeck...
 start "" "%EXE%"
 timeout /t 2 >nul
 exit /b 0
+
+:retire
+rem Best effort: move the directory aside, then try to delete it in the
+rem background. If a file is not ours we simply leave the backup behind.
+move "%~1" "%~1.retired" >nul 2>&1
+if exist "%~1" (
+  start "" /min cmd /c "timeout /t 1 >nul & rd /s /q \\"%~1\\""
+)
+exit /b 0
 `;
 
 const uninstallCmd = `@echo off
 setlocal EnableExtensions
 title RemoteDeck 卸载
-set "DEST=%LOCALAPPDATA%\\Programs\\RemoteDeck"
+set "DEST=%LOCALAPPDATA%\\Programs\\RemoteDeck-${version}"
 
 echo.
 echo   正在卸载 RemoteDeck...
@@ -119,7 +137,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%PS%" >nul 2>&1
 del "%PS%" >nul 2>&1
 
 echo   删除程序文件...
-start "" /min cmd /c "timeout /t 2 >nul & rd /s /q \\"%DEST%\\""
+for /d %%D in ("%LOCALAPPDATA%\\Programs\\RemoteDeck*") do (
+  start "" /min cmd /c "timeout /t 2 >nul & rd /s /q \\"%%~fD\\""
+)
 
 echo   卸载完成。
 timeout /t 2 >nul
@@ -133,7 +153,7 @@ await fs.writeFile(
   [
     `RemoteDeck ${version}`,
     '',
-    '安装：双击「安装.cmd」，会把程序装到 %LOCALAPPDATA%\\Programs\\RemoteDeck，',
+    '安装：双击「安装.cmd」，会把程序装到 %LOCALAPPDATA%\\Programs\\RemoteDeck-<版本>，',
     '      并在桌面和开始菜单创建 RemoteDeck 快捷方式，然后自动启动。',
     '',
     '卸载：双击「卸载.cmd」，或从 Windows「设置 → 应用」里卸载 RemoteDeck。',
