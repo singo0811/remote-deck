@@ -335,10 +335,29 @@ async function writeAutostartTaskXml(exePath) {
 
 async function loadSettings() {
   const userData = app.getPath('userData');
-  settingsPath = path.join(userData, 'settings.json');
+  const perUser = path.join(userData, 'settings.json');
+  // The boot guardian runs as SYSTEM and therefore has its own %APPDATA%; the
+  // relay settings must be shared or that instance comes up with no relay at all
+  // and never appears in the device list.
+  const sharedDir = (() => {
+    const base = process.env.ProgramData || path.join(process.env.SystemDrive || 'C:', 'ProgramData');
+    return path.join(base, 'RemoteDeck');
+  })();
+  const shared = path.join(sharedDir, 'settings.json');
+
+  settingsPath = shared;
   try {
-    const raw = await fs.readFile(settingsPath, 'utf8');
+    const raw = await fs.readFile(shared, 'utf8');
     desktopSettings = { ...desktopSettings, ...JSON.parse(raw) };
+    return;
+  } catch {}
+
+  // Migrate the per-user file once so existing installs keep their relay.
+  try {
+    const raw = await fs.readFile(perUser, 'utf8');
+    desktopSettings = { ...desktopSettings, ...JSON.parse(raw) };
+    await fs.mkdir(sharedDir, { recursive: true });
+    await fs.writeFile(shared, JSON.stringify(desktopSettings, null, 2), 'utf8');
   } catch {}
 }
 
