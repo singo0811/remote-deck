@@ -19,11 +19,14 @@ if (process.argv.includes('--secure-desktop')) {
   process.env.REMOTEDECK_SECURE_DESKTOP = '1';
 }
 
-const gotLock = isSmokeTest ? true : app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-  process.exit(0);
-}
+// A second launch normally just focuses the first window. That is wrong when the
+// first one is the headless boot-service instance (SYSTEM session, no window at
+// all): the user starts the app, it quits immediately, and nothing appears.
+// So the headless instance never takes the singleton lock, and a second launch
+// continues as a UI-only client of the host that already owns the LAN port.
+const isHeadlessInstance = process.argv.includes('--headless') || process.env.REMOTEDECK_SECURE_DESKTOP === '1';
+const gotLock = isSmokeTest || isHeadlessInstance ? true : app.requestSingleInstanceLock();
+const uiOnlyInstance = !isHeadlessInstance && !gotLock;
 
 let mainWindow = null;
 let tray = null;
@@ -501,6 +504,15 @@ async function startHostAgent() {
   if (preferredPort === 0) {
     agent = makeAgent(0);
     return await agent.start();
+  }
+
+  // A second launch (single-instance lock held by the headless boot service)
+  // just borrows that host so the window still works.
+  if (uiOnlyInstance) {
+    const existing = await probeLocalHost(preferredPort);
+    if (existing && existing.deviceId) {
+      return { ...existing, lanPort: preferredPort, pin: '', reusedHost: true };
+    }
   }
 
   const retryDelays = [250, 500, 750, 1000, 1000, 1000, 1000, 1000];
