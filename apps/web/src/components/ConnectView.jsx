@@ -9,7 +9,7 @@ import {
 import { DeskHubView } from './DeskHubView.jsx';
 import { PhoneMirrorPane } from './PhoneMirrorPane.jsx';
 import AccountPane from './AccountPane.jsx';
-import { accountApiBase } from '../lib/account.js';
+import { accountApiBase, setAccountApiBase } from '../lib/account.js';
 
 const STORAGE_RECENT_KEY = 'remotedeck.recent.v1';
 
@@ -123,8 +123,8 @@ export function ConnectView({
   const hostState = useHostDesk(desktopApi);
 
   // The server field is intentionally hidden: the page origin is the server.
-  // Inside the desktop app the origin is loopback, so fall back to the public
-  // address the host itself is connected to.
+  // Inside the desktop app the origin is loopback, so fall back to the relay the
+  // host itself is connected to (and remember it for account calls).
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const isLoopback = /^(127\.0\.0\.1|localhost|\[::1\])$/i.test(window.location.hostname);
@@ -132,6 +132,7 @@ export function ConnectView({
     const relay = hostState.hostStatus?.relayUrl;
     if (!relay) return;
     const http = String(relay).replace(/^ws:/i, 'http:').replace(/^wss:/i, 'https:').replace(/\/ws$/i, '');
+    setAccountApiBase(http);
     setServerUrl((cur) => (cur && !/^(https?:\/\/)?(127\.0\.0\.1|localhost)(:|\/|$)/i.test(cur) ? cur : http));
   }, [hostState.hostStatus?.relayUrl]);
 

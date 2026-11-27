@@ -3,7 +3,7 @@ import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 
-const DEFAULT_SERVER = 'https://miaosizhineng.online';
+const SERVER_KEY = 'server_url';
 const PREFS_NAME = 'remotedeck_account';
 const TOKEN_KEY = 'token';
 const PHONE_ID_KEY = 'phone_device_id';
@@ -102,7 +102,7 @@ export struct AccountPane {
   @State errorMsg: string = '';
   @State loaded: boolean = false;
 
-  private server: string = DEFAULT_SERVER;
+  @State server: string = '';
   private phoneId: string = '';
   private pingTimer: number = -1;
   private listTimer: number = -1;
@@ -153,8 +153,9 @@ export struct AccountPane {
 
   private async init(): Promise<void> {
     await this.ensurePhoneId();
+    this.server = (await this.readPref(SERVER_KEY)) || '';
     const saved = await this.readPref(TOKEN_KEY);
-    if (saved.length === 0) {
+    if (saved.length === 0 || this.server.length === 0) {
       this.loaded = true;
       return;
     }
@@ -229,9 +230,16 @@ export struct AccountPane {
 
   private async submit(): Promise<void> {
     if (this.busy) return;
+    const server = this.server.trim().replace(/\/+$/, '');
+    if (server.length === 0) {
+      this.errorMsg = '请先填写服务器地址';
+      return;
+    }
     this.busy = true;
     this.errorMsg = '';
     try {
+      this.server = server;
+      await this.writePref(SERVER_KEY, server);
       const path = this.registerMode ? '/api/auth/register' : '/api/auth/login';
       const body: AuthBody = {
         username: this.nameInput.trim(),
@@ -281,6 +289,24 @@ export struct AccountPane {
       .alignItems(HorizontalAlign.Center)
       .width('100%')
       .margin({ top: 8, bottom: 6 })
+
+      Column({ space: 7 }) {
+        Text('服务器')
+          .fontSize(12)
+          .fontColor('#8A9BB8')
+        TextInput({ text: this.server, placeholder: 'https://你的中继地址' })
+          .height(46)
+          .fontSize(14)
+          .fontColor('#EEF2F9')
+          .placeholderColor('#566B88')
+          .backgroundColor('#080C14')
+          .borderRadius(10)
+          .border({ width: 1, color: '#22314C' })
+          .padding({ left: 14, right: 14 })
+          .onChange((v: string) => { this.server = v.trim(); })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .width('100%')
 
       Column({ space: 7 }) {
         Text('账号')

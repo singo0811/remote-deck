@@ -1,19 +1,28 @@
 const TOKEN_KEY = 'rd_account_token';
 const PROFILE_KEY = 'rd_account_profile';
-const PUBLIC_SERVER = 'https://miaosizhineng.online';
+const BASE_KEY = 'rd_account_base';
+
+/** Relay address configured at runtime (desktop relays its setting to the page). */
+export function setAccountApiBase(url) {
+  try {
+    const next = String(url || '').trim().replace(/\/+$/, '');
+    if (next) localStorage.setItem(BASE_KEY, next);
+  } catch {}
+}
 
 /**
- * Account calls must reach the relay, which owns /api/auth. When the page is
- * opened from the host itself (127.0.0.1 or a LAN address) that origin has no
- * account API, so fall back to the public relay.
+ * Account calls must reach the relay, which owns /api/auth. The page origin is
+ * the relay when the UI is served by it; on the desktop the UI is served from
+ * the host itself, so the configured relay address is used instead. No server
+ * address is baked into the source.
  */
 export function accountApiBase() {
-  if (typeof window === 'undefined') return PUBLIC_SERVER;
-  const { hostname, origin } = window.location;
-  const isLoopback = /^(127\.0\.0\.1|localhost|\[::1\]|::1)$/i.test(hostname);
-  const isPrivate = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostname);
-  if (isLoopback || isPrivate) return PUBLIC_SERVER;
-  return origin;
+  if (typeof window === 'undefined') return '';
+  try {
+    const configured = localStorage.getItem(BASE_KEY) || '';
+    if (configured) return configured;
+  } catch {}
+  return window.location.origin;
 }
 
 export function getToken() {

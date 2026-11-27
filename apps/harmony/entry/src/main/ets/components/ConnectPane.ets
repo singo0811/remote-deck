@@ -19,6 +19,11 @@ interface AcctDevice {
   online?: boolean;
 }
 
+interface JsonHeader {
+  'Content-Type': string;
+  Authorization?: string;
+}
+
 interface AcctListResult {
   ok?: boolean;
   devices?: AcctDevice[];
@@ -127,9 +132,15 @@ export struct ConnectPane {
       }
       const req = http.createHttp();
       try {
-        const res = await req.request('https://miaosizhineng.online/api/auth/devices', {
+        const server = (await store.get('server_url', '')) as string;
+        if (server.length === 0) {
+          this.acctDevices = [];
+          return;
+        }
+        const header: JsonHeader = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+        const res = await req.request(`${server}/api/auth/devices`, {
           method: http.RequestMethod.GET,
-          header: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          header: header,
           connectTimeout: 10000,
           readTimeout: 10000,
         });
