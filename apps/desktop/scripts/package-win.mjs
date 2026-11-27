@@ -9,6 +9,7 @@ const electronDist = path.join(repoRoot, 'node_modules/electron/dist');
 const customOutput = process.argv[2];
 const outDir = customOutput ? path.resolve(customOutput) : path.join(repoRoot, 'dist/RemoteDeck-win32-x64');
 const appDir = path.join(outDir, 'resources/app');
+const appVersion = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version || '0.0.0';
 
 if (!existsSync(electronDist)) {
   throw new Error(`Electron dist not found at ${electronDist}`);
@@ -44,7 +45,7 @@ await fs.writeFile(
   JSON.stringify(
     {
       name: 'remote-deck-desktop',
-      version: '1.0.0',
+      version: appVersion,
       private: true,
       type: 'module',
       main: 'apps/desktop/src/main.mjs',
