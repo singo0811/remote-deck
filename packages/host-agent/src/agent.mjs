@@ -448,6 +448,8 @@ export class HostAgent {
     this.iceServers = [];
     this.reconnectTimer = null;
     this.relayWatchdog = null;
+    this.lastRelayError = '';
+    this.relayAttemptAt = 0;
     this.heartbeatTimer = null;
     this.stopped = false;
     this.displays = [];
@@ -837,6 +839,10 @@ export class HostAgent {
         if (this.stopped || !this.relayUrl || this.relayConnected) return;
         const state = this.relayWs?.readyState;
         if (state === WebSocket.CONNECTING) return;
+        // Force a fresh socket: a half-open one never emits close, so a plain
+        // reconnect would stack sockets that all stay stuck.
+        try { this.relayWs?.terminate?.(); } catch {}
+        this.relayWs = null;
         this.#connectRelay();
       }, 15000);
       // Never keep the process (or a test runner) alive just for this timer.
@@ -987,6 +993,8 @@ export class HostAgent {
           tunnelUrl: this.tunnelUrl,
           relayUrl: this.relayUrl,
           relayConnected: Boolean(this.relayConnected),
+          relayState: this.relayWs ? this.relayWs.readyState : -1,
+          relayError: this.lastRelayError || '',
           pin: this.pin,
         }));
         return;
@@ -1303,7 +1311,8 @@ export class HostAgent {
 
   #connectRelay() {
     if (this.stopped || !this.relayUrl) return;
-    const ws = new WebSocket(normalizeRelayWsUrl(this.relayUrl));
+    this.relayAttemptAt = Date.now();
+    const ws = new WebSocket(normalizeRelayWsUrl(this.relayUrl), { handshakeTimeout: 8000 });
     this.relayWs = ws;
 
     ws.on('open', () => {
@@ -1371,7 +1380,10 @@ export class HostAgent {
       }
     });
 
-    ws.on('error', () => {});
+    ws.on('error', (err) => {
+      this.lastRelayError = String(err?.message || err);
+      console.error('[relay] socket error:', this.lastRelayError);
+    });
   }
 
   #sendHeartbeat() {
